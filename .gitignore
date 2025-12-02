@@ -1,6 +1,7 @@
 .cursor/*
 !.cursor/rules/
 !.cursor/commands/
+!.cursor/tools/
 !.cursor/commands/**
 !.cursor/rules/**
 !.cursor/tools/**
