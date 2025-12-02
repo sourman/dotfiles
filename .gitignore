@@ -3,3 +3,6 @@
 !.cursor/commands/
 !.cursor/commands/**
 !.cursor/rules/**
+!.cursor/tools/**
+.bash_history
+.bash_logout
