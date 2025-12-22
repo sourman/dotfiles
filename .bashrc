@@ -6,6 +6,28 @@
 # If not running interactively, don't do anything
 [ -z "$PS1" ] && return
 
+# ============================================================================
+# BASH HISTORY CONFIGURATION
+# ============================================================================
+# Keep a large history
+export HISTSIZE=10000                    # Commands in memory
+export HISTFILESIZE=20000                # Commands in history file
+
+# Append to history file instead of overwriting (critical for multiple terminals)
+shopt -s histappend
+
+# Avoid duplicates and commands starting with space
+export HISTCONTROL=ignoreboth:erasedups
+
+# Add timestamps to history
+export HISTTIMEFORMAT='%F %T  '
+
+# Save history after each command (prevents loss on crashes/forced closures)
+# This is crucial for Cursor/IDE terminals that may close unexpectedly
+PROMPT_COMMAND='history -a'
+
+# ============================================================================
+
 # check the window size after each command and, if necessary,
 # update the values of LINES and COLUMNS.
 shopt -s checkwinsize
