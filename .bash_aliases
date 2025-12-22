@@ -16,4 +16,5 @@ alias docked='docker'
 alias docket='docker'
 alias supabase='npx supabase'
 alias sb='npx supabase'
-torok() { repo="$(basename "$(pwd)")"; cd ~/.cursor/worktrees/"${repo}__WSL__Ubuntu_/"; }
+alias claude='claude --dangerously-skip-permissions'
+alias rm='trash'
