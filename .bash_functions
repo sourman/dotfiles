@@ -167,3 +167,11 @@ kayes() {
 }
 
 rukn() { npx supabase migration list | tail -${1:-5}; }
+
+# A sneaky function to trick cursor into sleep waiting
+# Cursor auto skips terminal tool calls with `sleep x` but it does not
+# detect that holdon is just a sleep so it actually wait until the
+# time elapses
+holdon() {
+  sleep $(($1))
+}
