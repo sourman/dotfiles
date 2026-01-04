@@ -10,13 +10,40 @@ pushy() {
 #!/bin/bash
 
 # Function 1: Start dev servers for recently created worktree directories
+# Usage: waled [lookback_minutes] [package_manager] [dev_args...]
+#   lookback_minutes: minutes to look back (default: 10)
+#   package_manager: npm, bun, or auto (default: auto)
+#   dev_args: additional arguments to pass to dev command (e.g., "web", "--port 3000")
+# Examples:
+#   waled 10                    # auto-detect, run "npm run dev" or "bun run dev"
+#   waled 10 bun                # use bun, run "bun run dev"
+#   waled 10 bun web            # use bun, run "bun run dev web"
+#   waled 10 auto web           # auto-detect, run "npm run dev web" or "bun run dev web"
+#   waled 10 web                # auto-detect, run "npm run dev web" or "bun run dev web"
 waled() {
   local lookback_minutes="${1:-10}"
 
   if ! [[ "$lookback_minutes" =~ ^[0-9]+$ ]]; then
     echo "Error: Lookback time must be a positive number (minutes)"
-    echo "Usage: cdworktree [lookback_minutes]"
+    echo "Usage: waled [lookback_minutes] [package_manager] [dev_args...]"
     return 1
+  fi
+
+  # Parse package manager and dev args
+  local pm="auto"
+  local dev_args=()
+  
+  shift  # Remove lookback_minutes from args
+  
+  if [ $# -gt 0 ]; then
+    # Check if second arg is a package manager
+    if [[ "$1" == "npm" || "$1" == "bun" || "$1" == "auto" ]]; then
+      pm="$1"
+      shift  # Remove package manager from args
+    fi
+    
+    # Remaining args are dev args
+    dev_args=("$@")
   fi
 
   repo="$(basename "$(pwd)")"
@@ -67,16 +94,56 @@ waled() {
       worktree_name="$(basename "$dir")"
       echo "Starting dev server for: $dir (worktree: $worktree_name)"
 
+      # Determine package manager for this directory
+      local detected_pm="$pm"
+      if [[ "$pm" == "auto" ]]; then
+        if [ -f "$dir/bun.lock" ] || [ -f "$dir/bun.lockb" ]; then
+          detected_pm="bun"
+        elif command -v bun >/dev/null 2>&1 && [ -f "$dir/package.json" ]; then
+          # Check if package.json has bun-specific scripts or if bun is preferred
+          if grep -q '"dev"' "$dir/package.json" 2>/dev/null; then
+            detected_pm="bun"
+          else
+            detected_pm="npm"
+          fi
+        else
+          detected_pm="npm"
+        fi
+      fi
+
+      echo "Using package manager: $detected_pm"
+      if [ ${#dev_args[@]} -gt 0 ]; then
+        echo "Dev args: ${dev_args[*]}"
+      fi
+
       # Store mapping
       echo "$worktree_name:$dir" >> "$map_file"
 
+      # Build command based on package manager
+      # Properly quote dev args for safe execution
+      local quoted_dev_args=""
+      if [ ${#dev_args[@]} -gt 0 ]; then
+        quoted_dev_args=" $(printf '%q ' "${dev_args[@]}")"
+      fi
+
+      if [[ "$detected_pm" == "bun" ]]; then
+        cmd="cd \"$dir\" && bun install && VITE_WORKTREE=\"$worktree_name\" bun dev$quoted_dev_args"
+      else
+        cmd="cd \"$dir\" && npm i && VITE_WORKTREE=\"$worktree_name\" npm run dev$quoted_dev_args"
+      fi
+
       (
-        cd "$dir" && npm i && VITE_WORKTREE="$worktree_name" npm run dev
+        eval "$cmd"
       ) &
       pid=$!
       echo "$pid" >> "$pid_file"
-      echo "$pid:$worktree_name" >> "${pid_file%.pid}.details"
-      echo "Spawned PID $pid for $worktree_name"
+      local dev_args_str="${dev_args[*]}"
+      echo "$pid:$worktree_name:$detected_pm:${dev_args_str}" >> "${pid_file%.pid}.details"
+      if [ ${#dev_args[@]} -gt 0 ]; then
+        echo "Spawned PID $pid for $worktree_name (using $detected_pm, args: ${dev_args[*]})"
+      else
+        echo "Spawned PID $pid for $worktree_name (using $detected_pm)"
+      fi
     fi
   done
 
@@ -89,6 +156,7 @@ waled() {
 }
 
 # Function 2: Kill all spawned worktree processes from either naming convention
+# Works for both npm and bun processes
 mawet() {
   # Find all PID files matching the pattern (regardless of convention)
   pid_files=$(find /tmp -maxdepth 1 -name "worktree-pids-*.pid" -type f 2>/dev/null)
@@ -101,6 +169,7 @@ mawet() {
   # Will match all possible pids from all conventions
   all_pids=()
   all_pgroups=()
+  pm_info=()
   while IFS= read -r pid_file; do
     if [ -f "$pid_file" ]; then
       echo "Reading PIDs from: $pid_file"
@@ -115,12 +184,26 @@ mawet() {
         fi
       done < "$pid_file"
 
-      # Also show the mapping before killing
+      # Also show the mapping and package manager info before killing
       map_file="${pid_file%.pid}.map"
+      details_file="${pid_file%.pid}.details"
       if [ -f "$map_file" ]; then
         echo "Killing servers:"
         cat "$map_file" | while IFS=: read -r name dir; do
-          echo "  - $name"
+          # Try to get package manager and dev args from details file
+          pm="unknown"
+          dev_args_display=""
+          if [ -f "$details_file" ]; then
+            pm_line=$(grep ":$name:" "$details_file" 2>/dev/null | head -1)
+            if [ -n "$pm_line" ]; then
+              pm=$(echo "$pm_line" | cut -d: -f3)
+              dev_args_display=$(echo "$pm_line" | cut -d: -f4-)
+              if [ -n "$dev_args_display" ]; then
+                dev_args_display=" (args: $dev_args_display)"
+              fi
+            fi
+          fi
+          echo "  - $name ($pm)$dev_args_display"
         done
       fi
     fi
