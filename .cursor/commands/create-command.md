@@ -1,0 +1,1 @@
+write a new command into .cursor/commands/command-name.md based on user input
