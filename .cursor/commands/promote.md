@@ -4,8 +4,8 @@ For files:
 1. Parse the input to determine the filename and folder type (commands, rules, plans, tools, or mcps)
 2. Check if the file exists in .cursor/{folder}/{filename} in the current project
 3. If the file doesn't exist, check if it's already in ~/.cursor/{folder}/ and inform the user
-4. If the file exists in the project, move it to
-~/.cursor/{folder}/{filename} and copy it to /c/User/USER/.cursor/{folder}/{filename}
+4. If the file exists in the project, move it using `mv` to
+~/.cursor/{folder}/{filename} and create and in a separate command using `cp` to copy it to /c/User/USER/.cursor/{folder}/{filename}
 5. Create the target directory in ~/.cursor & /c/User/USER/.cursor  if it doesn't exist
 6. Confirm the move was successful
 
