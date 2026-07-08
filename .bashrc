@@ -105,8 +105,64 @@ if [ -f ~/.bash_functions ]; then
     . ~/.bash_functions
 fi
 
-# Scripts dir (version-controlled text scripts, tracked in dotfiles repo).
-[ -d "$HOME/.local/scripts" ] && PATH="$HOME/.local/scripts:$PATH"
+# ============================================================================
+# PATH CONFIGURATION
+# All PATH modifications live here so they work in both login and non-login
+# shells. WSL-native tools are prepended so they always beat Windows paths.
+# ============================================================================
 
-export NVM_DIR="$HOME/.nvm"
+# bun (package manager / runtime)
+if [ -d "$HOME/.bun/bin" ] ; then
+    PATH="$HOME/.bun/bin:$PATH"
+fi
+
+# bun global bin — where `bun install -g` drops executables (e.g. mcporter).
+# bun resolves this to $XDG_CACHE_HOME/.bun/bin (defaults to ~/.cache/.bun/bin).
+if [ -d "${XDG_CACHE_HOME:-$HOME/.cache}/.bun/bin" ] ; then
+    PATH="${XDG_CACHE_HOME:-$HOME/.cache}/.bun/bin:$PATH"
+fi
+
+# nvm (Node.js version manager)
+export NVM_DIR="$HOME/.config/nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+# pnpm
+if [ -d "$HOME/.local/share/pnpm/bin" ] ; then
+    PATH="$HOME/.local/share/pnpm/bin:$PATH"
+fi
+
+# AWS CLI
+if [ -d "$HOME/.local/aws-cli/v2/current/dist" ] ; then
+    PATH="$HOME/.local/aws-cli/v2/current/dist:$PATH"
+elif [ -d "$HOME/.local/aws-cli/v2/2.32.23/dist" ] ; then
+    PATH="$HOME/.local/aws-cli/v2/2.32.23/dist:$PATH"
+fi
+
+# Snap binaries
+if [ -d "/snap/bin" ] ; then
+    PATH="/snap/bin:$PATH"
+fi
+
+# Android SDK
+export ANDROID_HOME=$HOME/Android/sdk
+PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/build-tools/34.0.0"
+
+# Go packages
+if [ -d "$HOME/go/bin" ] ; then
+    PATH="$HOME/go/bin:$PATH"
+fi
+
+# ~/.local/bin (agent-browser wrapper, user bins)
+if [ -d "$HOME/.local/bin" ] ; then
+    PATH="$HOME/.local/bin:$PATH"
+fi
+
+# Scripts dir (version-controlled text scripts, tracked in dotfiles repo).
+if [ -d "$HOME/.local/scripts" ] ; then
+    PATH="$HOME/.local/scripts:$PATH"
+fi
+
+export PATH
+
+# Starship prompt (git-aware, nerd-font powerline) — overrides PS1 above
+eval "$(starship init bash)"
