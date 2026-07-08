@@ -54,13 +54,13 @@ fi
 #esac
 
 # enable bash completion in interactive shells
-#if ! shopt -oq posix; then
-#  if [ -f /usr/share/bash-completion/bash_completion ]; then
-#    . /usr/share/bash-completion/bash_completion
-#  elif [ -f /etc/bash_completion ]; then
-#    . /etc/bash_completion
-#  fi
-#fi
+if ! shopt -oq posix; then
+  if [ -f /usr/share/bash-completion/bash_completion ]; then
+    . /usr/share/bash-completion/bash_completion
+  elif [ -f /etc/bash_completion ]; then
+    . /etc/bash_completion
+  fi
+fi
 
 # sudo hint
 if [ ! -e "$HOME/.sudo_as_admin_successful" ] && [ ! -e "$HOME/.hushlogin" ] ; then
@@ -94,7 +94,6 @@ fi
 gsutil-tree() { local bucket_path="$1"; bucket_path="${bucket_path#gs://}"; gsutil ls -r "gs://$bucket_path" | awk 'BEGIN { path[0] = "" } /:$/ { dir = substr($0, 1, length($0)-1); if (dir == ".") { depth = 0; path[0] = "" } else { depth = gsub(/\//, "/", dir); path[depth] = dir } if (depth > 0) { for (i = 1; i < depth; i++) printf "| "; printf "|____" dir; gsub(/.*\//, "", dir); print dir } } /^$/ { next } !/^[[:space:]]*$/ && !/:$/ { for (i = 0; i < depth; i++) printf "| "; print "|____" $0 }'; }
 
 source /usr/share/bash-completion/completions/git
-
 # Source bash aliases if file exists
 if [ -f ~/.bash_aliases ]; then
     . ~/.bash_aliases
@@ -164,5 +163,16 @@ fi
 
 export PATH
 
+# ble.sh (syntax highlighting, auto-suggestions, menu completion) — source
+# early with --noattach so it's ready before starship; attach at the very end.
+if [[ $- == *i* ]] && [ -f "$HOME/.local/share/blesh/ble.sh" ]; then
+  source "$HOME/.local/share/blesh/ble.sh" --noattach
+fi
+
 # Starship prompt (git-aware, nerd-font powerline) — overrides PS1 above
 eval "$(starship init bash)"
+
+# Attach ble.sh last (after starship) so it wraps the prompt properly.
+if [[ ${BLE_VERSION-} ]]; then
+  ble-attach
+fi
