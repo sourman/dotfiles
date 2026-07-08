@@ -93,6 +93,20 @@ wt() {
     ls|list)
       _wt_entries | awk -F'\t' '{printf "%-28s %-30s %s\n", $1, $2, $3}'
       ;;
+    new)
+      shift  # drop the "new" so "$@" is just the flags + branch name
+      [ "$#" -eq 0 ] && { echo "wt new: branch name required (e.g. wt new feat/thing)" >&2; return 1; }
+      local before after new_path
+      before="$(_wt_entries | awk -F'\t' '{print $3}' | sort)"
+      new-worktree "$@" || return $?
+      after="$(_wt_entries | awk -F'\t' '{print $3}' | sort)"
+      new_path="$(comm -13 <(echo "$before") <(echo "$after") | head -1)"
+      if [ -n "$new_path" ]; then
+        echo
+        echo "→ cd $(basename "$new_path")"
+        cd "$new_path"
+      fi
+      ;;
     rm|remove)
       local query="$2" matches count path name
       if [ -n "$query" ]; then
@@ -126,6 +140,8 @@ wt — worktree navigator (jump is the default)
 
   wt                fzf-pick a worktree → cd
   wt feat-mcp       substring-match → cd (1 match: instant, N: fzf filtered)
+  wt new <branch>   create a worktree via new-worktree, then cd into it
+                    (all new-worktree flags pass through: --base, --clean, etc.)
   wt list | wt ls   list worktrees (name + branch + path)
   wt rm [name]      remove a worktree (fzf if no arg, substring if given)
   wt prune          prune stale worktree refs

@@ -59,7 +59,7 @@ complete -F _ssh_smart ssh
 _wt_completion() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
     # Subcommands that take a worktree name as their next arg
-    local subcmds="go list ls rm remove prune help -h --help"
+    local subcmds="go new list ls rm remove prune help -h --help"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
         # First arg: subcommands + all worktree names (since jump is default)
