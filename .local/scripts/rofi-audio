@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# rofi-audio: switch the default PulseAudio output sink (e.g. laptop speakers
+# <-> Bluetooth headset), control volume, and drive media playback (playerctl).
+# Text-only labels (rofi font is Inter, no nerd glyphs).
+set -o pipefail
+
+ROFI=(rofi -dmenu -i -no-custom -selected-row 0 -p Audio)
+
+default_sink=$(pactl get-default-sink 2>/dev/null || true)
+cur_vol=$(pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -oE '[0-9]+%' | head -1 | tr -d '%')
+cur_mute=$(pactl get-sink-mute @DEFAULT_SINK@ 2>/dev/null | awk '{print $2}')
+if [[ "$cur_mute" == "yes" ]]; then vol_state="MUTED"; else vol_state="${cur_vol:-?}%"; fi
+
+# Current media, if any (playerctl exits non-zero with no player).
+pb_line="(no media player)"
+if title=$(playerctl metadata --format '{{title}} — {{artist}}' 2>/dev/null) && [[ -n "$title" && "$title" != " — " ]]; then
+  pb_line="$(playerctl status 2>/dev/null || echo '?'): ${title}"
+fi
+
+# Build the output-device list, marking the active sink with '*'.
+declare -A sink_for
+sink_block=""
+while IFS=$'\t' read -r name desc; do
+  [[ -z "$name" ]] && continue
+  sink_for["$desc"]="$name"
+  if [[ "$name" == "$default_sink" ]]; then
+    sink_block+=$'\n'"* ${desc}"
+  else
+    sink_block+=$'\n'"  ${desc}"
+  fi
+done < <(pactl list sinks 2>/dev/null | awk '
+  /^[ \t]*Name:/        { n = $2 }
+  /^[ \t]*Description:/ { d = substr($0, index($0, ":") + 2); if (n != "") { print n "\t" d; n = "" } }')
+
+menu=$(printf 'Volume: %s\nVolume +5%%\nVolume -5%%\nMute toggle\n--- Playback ---\nPlay/Pause   %s\nNext track\nPrevious track\nStop\n--- Output device ---%s\n' \
+  "$vol_state" "$pb_line" "$sink_block")
+
+choice=$(printf '%s\n' "$menu" | "${ROFI[@]}" -theme-str 'window {width: 42%;} listview {lines: 10;}' 2>/dev/null)
+[[ -z "$choice" ]] && exit 0
+
+case "$choice" in
+  "Volume +5%")  pactl set-sink-volume  @DEFAULT_SINK@ +5% ;;
+  "Volume -5%")  pactl set-sink-volume  @DEFAULT_SINK@ -5% ;;
+  "Mute toggle") pactl set-sink-mute    @DEFAULT_SINK@ toggle ;;
+  "Play/Pause"*) playerctl play-pause ;;
+  "Next track")  playerctl next ;;
+  "Previous track") playerctl previous ;;
+  "Stop")        playerctl stop ;;
+  *)
+    # Otherwise it's an output-device line: recover the description and switch.
+    desc="${choice#\* }"                                  # drop "* " prefix
+    desc="${desc#"${desc%%[![:space:]]*}"}"               # trim leading spaces
+    name="${sink_for[$desc]:-}"
+    if [[ -n "$name" && "$name" != "$default_sink" ]]; then
+      pactl set-default-sink "$name"
+      pactl list short sink-inputs | awk '{print $1}' | while read -r i; do
+        pactl move-sink-input "$i" "$name" 2>/dev/null || true
+      done
+      notify-send -i audio-headphones "Audio output" "Switched to ${desc}"
+    fi
+    ;;
+esac

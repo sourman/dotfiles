@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Auto-dismiss XFCE's minimal display-mode hotplug dialog after a timeout.
+#
+# When a monitor is connected, xfsettingsd launches `xfce4-display-settings -m`
+# (the small Extend / Mirror / External-only picker). That dialog has NO built-in
+# auto-close, so it lingers forever if ignored. This watches for that exact
+# process and SIGTERMs it once it has outlived AUTOCLOSE_SEC seconds.
+#
+# Picking a mode already exits the dialog, so this only ever closes an *ignored*
+# popup. The full Display Settings window opened via the dialog's "Advanced"
+# button runs WITHOUT -m, so it is left alone.
+set -u
+AUTOCLOSE_SEC="${AUTOCLOSE_SEC:-30}"
+POLL_SEC="${POLL_SEC:-3}"
+declare -A SEEN=()                       # pid -> first-seen epoch seconds
+
+epoch() { date +%s; }
+
+# Print PIDs of the MINIMAL dialog only (cmdline contains -m or --minimal).
+minimal_pids() {
+  local pid cmd
+  for pid in $(pgrep -f 'xfce4-display-settings'); do
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+    case "$cmd" in
+      *"-m"*|*"--minimal"*) printf '%s\n' "$pid" ;;
+    esac
+  done
+}
+
+while :; do
+  now=$(epoch)
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    if [ -z "${SEEN[$pid]:-}" ]; then SEEN["$pid"]=$now; fi
+    age=$(( now - SEEN[$pid] ))
+    if [ "$age" -ge "$AUTOCLOSE_SEC" ]; then
+      # re-check it is STILL the minimal dialog right before closing (PID reuse guard)
+      cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+      case "$cmd" in
+        *"-m"*|*"--minimal"*)
+          kill "$pid" 2>/dev/null && \
+            printf '%s closed ignored display dialog pid %s after %ss\n' \
+              "$(date '+%F %T')" "$pid" "$age" >&2
+          ;;
+      esac
+      unset 'SEEN[$pid]'
+    fi
+  done < <(minimal_pids)
+  # prune exited pids from the map
+  for pid in "${!SEEN[@]}"; do
+    kill -0 "$pid" 2>/dev/null || unset 'SEEN[$pid]'
+  done
+  sleep "$POLL_SEC"
+done

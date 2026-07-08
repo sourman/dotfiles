@@ -1,0 +1,9 @@
+#!/bin/sh
+# Dock: switch to the docked layout (external primary + laptop extended).
+# Normally plugging in the external does this automatically via autorandr; run
+# this manually only if the auto-switch didn't trigger.
+export DISPLAY="${DISPLAY:-:0.0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+
+autorandr --load docked

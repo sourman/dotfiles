@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# upwork-status — infer the Upwork Desktop App time-tracker state from its own
+# log. PRIMARY signal: the app logs an explicit "Tracker Toggled { status: ... }"
+# Redux line on every start/stop (status: 'started' | 'stopping' | 'stopped').
+# The LAST toggle's status is authoritative. FALLBACK (no toggle found yet): the
+# app emits "TRACKER_STEP" ~every 5s while running, so a recent step == tracking.
+# No network, no scraping, no API.
+#
+# Modes:
+#   --state   print one word: tracking | idle | notrunning | unknown
+#   --detail  human-readable multi-line summary
+#   --genmon  xfce4-genmon-plugin markup (●/○/✕)
+#   --notify  pop a desktop notification with the detail
+#   --watch   loop forever; fire a notification on every state change (run as a
+#             systemd user service)
+set -o pipefail
+
+LOG_DIR="$HOME/.Upwork/Upwork/Logs"
+TODAY=$(date +%Y%m%d)
+MAIN_LOG="$LOG_DIR/upwork..${TODAY}.log"
+THRESH=90                                              # TRACKER_STEP window (s)
+STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/upwork-tracker/state"
+
+app_running() { pgrep -f '/opt/Upwork/upwork' >/dev/null 2>&1; }
+
+last_step_epoch() {        # epoch secs of most recent TRACKER_STEP, or empty
+  [[ -f "$MAIN_LOG" ]] || return
+  local ts
+  ts=$(awk '/^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+\]/ { t=$1 }
+            /"type": "TRACKER_STEP"/ { gsub(/[\[\]]/,"",t); print t }' "$MAIN_LOG" 2>/dev/null | tail -1)
+  [[ -n "$ts" ]] && date -d "${ts:0:19}" +%s 2>/dev/null
+}
+
+last_toggle_status() {     # status word from the most recent "Tracker Toggled" line
+                           # → started | stopping | stopped | "" (none)
+  [[ -f "$MAIN_LOG" ]] || return
+  grep "Tracker Toggled" "$MAIN_LOG" 2>/dev/null | tail -1 \
+    | sed -n "s/.*status: '\([a-z]*\)'.*/\1/p"
+}
+
+last_num() {               # last <number> matching a "field": N pattern
+  [[ -f "$MAIN_LOG" ]] || { echo 0; return; }
+  grep -oE "$1\"?[[:space:]]*:[[:space:]]*[0-9]+" "$MAIN_LOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+'
+  echo
+}
+
+compute_state() {          # sets globals: STATE, AGE, KEYS, CLICKS
+  local last now
+  last=$(last_step_epoch); now=$(date +%s)
+  AGE=0; [[ -n "$last" ]] && AGE=$((now - last))
+  KEYS=$(last_num '"keyboardPresses"')
+  CLICKS=$(last_num '"mouseClicks"')
+
+  if ! app_running; then STATE="notrunning"; return; fi
+
+  # Primary signal: the app's explicit toggle status (authoritative).
+  local toggle
+  toggle=$(last_toggle_status)
+  case "$toggle" in
+    started)          STATE="tracking"; return ;;
+    stopping|stopped) STATE="idle"; return ;;
+  esac
+
+  # Fallback: no toggle logged yet — infer from TRACKER_STEP cadence.
+  if [[ -z "$last" ]]; then STATE="unknown"; return; fi
+  if (( AGE <= THRESH )); then STATE="tracking"; else STATE="idle"; fi
+}
+
+print_state()  { compute_state; echo "$STATE"; }
+print_code()   { compute_state; case "$STATE" in tracking) echo 2;; idle) echo 1;; notrunning) echo 0;; *) echo -1;; esac; }
+
+print_detail() {
+  compute_state
+  case "$STATE" in
+    notrunning) echo "Upwork app: not running" ;;
+    unknown)    echo "Upwork app: running, no tracker log yet" ;;
+    tracking)   echo "Upwork tracker: TRACKING"
+                echo "Last interval: ${KEYS:-0} keys, ${CLICKS:-0} clicks"
+                echo "Contract snapshot cadence OK (step ${AGE}s ago)" ;;
+    idle)       echo "Upwork tracker: IDLE (app open, not tracking)"
+                echo "Last tracking activity: ${AGE}s ago" ;;
+  esac
+}
+
+print_genmon() {
+  compute_state
+  local sym
+  case "$STATE" in tracking) sym="●";; idle) sym="○";; notrunning) sym="✕";; *) sym="?";; esac
+  local tool; tool=$(print_detail | sed ':a;N;$!ba;s/\n/ — /g')
+  printf '<txt>%s Upwork</txt><tool>%s</tool><click>upwork-status --notify</click>\n' "$sym" "$tool"
+}
+
+do_notify() {
+  compute_state
+  local icon
+  case "$STATE" in tracking) icon="media-record";; notrunning) icon="system-search";; *) icon="user-idle";; esac
+  notify-send -i "$icon" "Upwork tracker" "$(print_detail | paste -sd ' ')"
+}
+
+do_watch() {
+  mkdir -p "$(dirname "$STATE_FILE")"
+  local prev=""
+  while true; do
+    compute_state
+    if [[ -n "$prev" && "$STATE" != "$prev" ]]; then
+      case "$STATE" in
+        tracking)    notify-send -i media-record "Upwork" "Started tracking time" ;;
+        idle)        notify-send -i user-idle   "Upwork" "Stopped tracking (idle)" ;;
+        notrunning)  notify-send -i system-search "Upwork" "App closed" ;;
+      esac
+    fi
+    printf '%s\n' "$STATE" > "$STATE_FILE"
+    prev="$STATE"
+    sleep 15
+  done
+}
+
+case "${1:---state}" in
+  --state)  print_state ;;
+  --code)   print_code ;;
+  --detail) print_detail ;;
+  --genmon) print_genmon ;;
+  --notify) do_notify ;;
+  --watch)  do_watch ;;
+  -h|--help|*) echo "usage: upwork-status [--state|--detail|--genmon|--notify|--watch]"; exit 1 ;;
+esac

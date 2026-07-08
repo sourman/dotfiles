@@ -1,0 +1,3 @@
+#!/bin/sh
+# Launch Telegram (installed as a Flatpak) as a native-looking `telegram` command.
+exec flatpak run org.telegram.desktop "$@"

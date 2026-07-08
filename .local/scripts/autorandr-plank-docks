@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# autorandr-plank-docks — keep BOTH Plank docks correctly placed across display
+# changes, self-healing.
+#
+# Plank is one-dock-per-instance; "show on all monitors" doesn't exist. This
+# machine runs two named instances (see [[plank-dual-dock-both-screens]]):
+#   dock1 = `plank`           pinned to the laptop (eDP-1), alive only while eDP-1 is active
+#   dock2 = `plank -n dock2`  pinned to the external (DP-2), only when docked
+#
+# What this script does:
+#   • dock2 — launched when an external output is connected, killed when not, so
+#     the two docks never overlap on the laptop when undocked.
+#   • dock1 — kept alive ONLY while eDP-1 is actually active. When eDP-1 is
+#     connected but DISABLED (lid closed, or left dark after a botched hotplug),
+#     Plank can't honor monitor='eDP-1' and strands dock1 on the external —
+#     stacking it on dock2 — so dock1 is killed then and respawned when eDP-1
+#     lights back up. While eDP-1 IS on, dock1 is restarted only when missing or
+#     mispositioned (Plank caches its startup position and mispositions on RandR
+#     changes — observed stranded at y=130). Checking first lets the plank-watch
+#     timer invoke this often as a self-heal without flicker.
+#
+# WHY A WATCHDOG, NOT JUST autorandr postswitch
+#   autorandr's postswitch hook is the fast path, but autorandr SKIPS postswitch
+#   when its profile APPLY FAILS — and the apply fails transitively during a
+#   hotplug (xrandr re-apply races with the CRTC mid-transition). When that
+#   happens, postswitch never runs and dock1 stays stranded. The plank-watch
+#   systemd-user timer (every ~8s) calls this script regardless, so dock1 always
+#   self-heals within a few seconds even when autorandr failed.
+#
+# WHEN IT RUNS
+#   • from ~/.config/autorandr/postswitch (no arg), AFTER autorandr-fix-primary;
+#   • every ~8s from the plank-watch.timer (no arg);
+#   • at login via the plank-docks autostart entry (--login) — dock2 lifecycle
+#     only (plank.desktop already placed dock1 on the stable login layout).
+#   Idempotent. Safe by hand:  autorandr-plank-docks [--login]
+set -u
+
+LOGIN_ONLY=0
+[ "${1:-}" = "--login" ] && LOGIN_ONLY=1
+
+# --- session env (autorandr may invoke us as root via the system service) ---
+if [ "$(id -u)" = 0 ]; then
+  HOME2=/home/ahmed; UID2=1000
+else
+  HOME2="$HOME"; UID2="$(id -u)"
+fi
+export DISPLAY="${DISPLAY:-:0.0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME2/.Xauthority}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$UID2/bus}"
+
+command -v xrandr >/dev/null || exit 0
+command -v plank  >/dev/null || exit 0
+
+DOCK2_NAME=dock2
+EXTERNAL_PRIORITY=(DP-2 DP-1 HDMI-2 HDMI-1)   # laptop panel eDP-1 deliberately excluded
+
+# --- is an external output connected right now? ---
+connected_ext=""
+for o in "${EXTERNAL_PRIORITY[@]}"; do
+  if xrandr --query | awk -v o="$o" '$1==o && $2=="connected" {f=1} END{exit !f}'; then
+    connected_ext="$o"; break
+  fi
+done
+
+# --- enumerate plank PIDs by instance via /proc/<pid>/cmdline.
+#   pgrep -x plank matches BOTH instances (same comm); the dock2 token in the
+#   cmdline distinguishes them. NB: never `pkill -f 'plank -n dock2'` from an
+#   inline shell — the pattern appears in that shell's own argv and it kills
+#   itself (exit 144); only safe inside a script whose argv is its path.
+pids_with_token() {    # $1=token → pids whose cmdline CONTAINS it   (dock2)
+  local token="$1" p cmd
+  pgrep -x plank | while read -r p; do
+    cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+    echo "$cmd" | grep -qw -- "$token" && echo "$p"
+  done
+}
+pids_without_token() { # $1=token → pids whose cmdline LACKS it        (dock1)
+  local token="$1" p cmd
+  pgrep -x plank | while read -r p; do
+    cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+    echo "$cmd" | grep -qw -- "$token" || echo "$p"
+  done
+}
+
+launch_as_user() {     # $@ = plank + args; drops to ahmed when invoked as root
+  if [ "$(id -u)" = 0 ]; then
+    setsid -f /usr/sbin/runuser -u ahmed -- env \
+      DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" \
+      DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+      "$@" </dev/null >/dev/null 2>&1
+  else
+    setsid -f "$@" </dev/null >/dev/null 2>&1
+  fi
+}
+
+# Return 0 (true) if dock1 needs a reposition-restart: it is missing, or its dock
+# window is NOT seated at the bottom of eDP-1. Returns 1 (leave it) when it looks
+# fine, when it just started (<4s; let it finish mapping — avoids a restart loop
+# with the watcher), or when we can't tell (no xdotool/can't parse → no flicker).
+dock1_needs_reposition() {
+  local d1="$1" p e youngest=999999
+  if [ -n "$d1" ]; then
+    for p in $d1; do e=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' '); [ "${e:-999999}" -lt "$youngest" ] && youngest="${e:-999999}"; done
+    [ "$youngest" -lt 4 ] && return 1
+  fi
+  command -v xdotool >/dev/null || return 1
+  local geom mw mh mx my mbottom mright w X Y WIDTH HEIGHT seated=0
+  geom="$(xrandr --query 2>/dev/null | awk -v m=eDP-1 '$1==m && $2=="connected"{for(i=3;i<=NF;i++)if($i~/^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/){print $i;exit}}')"
+  [ -n "$geom" ] || return 1
+  IFS=x+ read -r mw mh mx my <<< "$geom"
+  mbottom=$((my+mh)); mright=$((mx+mw))
+  for w in $(xdotool search --class plank 2>/dev/null); do
+    eval "$(xdotool getwindowgeometry --shell "$w" 2>/dev/null | grep -E '^(X|Y|WIDTH|HEIGHT)=')"
+    [ "${WIDTH:-0}" -gt 200 ] || continue                       # skip tiny aux windows
+    if [ "$((Y+HEIGHT))" -ge "$((mbottom-80))" ] && [ "$((Y+HEIGHT))" -le "$((mbottom+80))" ] && [ "$X" -lt "$mright" ]; then
+      seated=1; break
+    fi
+  done
+  [ "$seated" -eq 0 ]
+}
+
+# --- dock2 lifecycle (always) ---
+if [ -n "$connected_ext" ]; then
+  [ -z "$(pids_with_token "$DOCK2_NAME")" ] && launch_as_user plank -n "$DOCK2_NAME"
+else
+  d2="$(pids_with_token "$DOCK2_NAME")"; [ -n "$d2" ] && kill -- $d2 2>/dev/null || true
+fi
+
+# --- dock1: alive only while eDP-1 is active; killed otherwise (no stacking) ---
+#   "active", not "connected": a disabled laptop panel stays "connected" in
+#   xrandr but has no CRTC and reports no geometry, so the connected test below
+#   is true while the screen is dark. listactivemonitors reflects the actual
+#   live CRTC set, which is what we need.
+if [ "$LOGIN_ONLY" = 0 ]; then
+  d1="$(pids_without_token "$DOCK2_NAME")"
+  if xrandr --listactivemonitors 2>/dev/null | grep -qw eDP-1; then
+    if [ -z "$d1" ] || dock1_needs_reposition "$d1"; then
+      [ -n "$d1" ] && kill -- $d1 2>/dev/null || true
+      sleep 1   # let the old window close before relaunch, else it can inherit stale geometry
+      launch_as_user plank
+    fi
+  else
+    # eDP-1 dark → dock1 has no home; kill it so it doesn't stack on dock2.
+    # The plank-watch timer respawns it within ~8s of eDP-1 coming back.
+    [ -n "$d1" ] && kill -- $d1 2>/dev/null || true
+  fi
+fi
+
+exit 0

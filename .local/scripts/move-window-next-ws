@@ -1,0 +1,14 @@
+#!/bin/bash
+# Move the active window to the NEXT workspace and follow it.
+# Bound to Ctrl+Alt+Shift+Down (workspaces are laid out vertically: Down = next).
+# xfwm4's move_window_*_workspace grabs never establish, so wmctrl does the move
+# and this is wired through xfce4-keyboard-shortcuts (xfsettingsd grabs it).
+export DISPLAY="${DISPLAY:-:0}"
+cur=$(xdotool get_desktop 2>/dev/null) || exit 0
+count=$(wmctrl -d 2>/dev/null | wc -l)
+next=$((cur + 1))
+[ "$next" -ge "$count" ] && exit 0
+wid=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | awk '{print $5}')
+case "$wid" in ''|0x0|'0x00000000') exit 0;; esac
+wmctrl -i -r "$wid" -t "$next" 2>/dev/null
+xdotool set_desktop "$next" 2>/dev/null   # follow the window

@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# rescue-windows — pull floating windows stranded off-screen back onto a
+# visible monitor. Idempotent: windows already on-screen are never touched.
+#
+# WHY THIS EXISTS
+#   When an external monitor is disconnected, xfwm4 re-fits *maximized* windows
+#   but leaves *floating* ones at their old absolute coordinates — which now sit
+#   just past the edge of the remaining screen (the "10 pixels on the right
+#   edge" problem). XFCE has no built-in fix for this, so we do it here.
+#
+# WHEN IT RUNS
+#   Via ~/.config/autorandr/postswitch after every autorandr profile switch —
+#   which autorandr performs on every display (un)plug (udev → autorandr.service)
+#   and on manual `display-dock` / `display-undock`. It is also safe to run by
+#   hand:  rescue-windows
+#
+# ALGORITHM
+#   For each normal window, test whether its centre point lies inside any
+#   *connected* monitor rectangle (parsed from xrandr). If not, slide it left
+#   onto the primary/top-left monitor, preserving its vertical position and
+#   size, cascading horizontally so rescued windows don't perfectly overlap.
+#   Skipped: dock/desktop/panel widgets, fullscreen windows, maximized windows
+#   (xfwm4 handles those).
+set -u
+
+# --- session env (autorandr may invoke us as root via the system service) ---
+if [ "$(id -u)" = 0 ]; then
+  HOME2=/home/ahmed; UID2=1000
+else
+  HOME2="$HOME"; UID2="$(id -u)"
+fi
+export DISPLAY="${DISPLAY:-:0.0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME2/.Xauthority}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$UID2/bus}"
+
+# Bail silently if there is no running WM / no required tools.
+command -v wmctrl  >/dev/null || exit 0
+command -v xdotool >/dev/null || exit 0
+wmctrl -m >/dev/null 2>&1 || exit 0
+
+# --- 1. Collect connected monitor rectangles ("WxH+X+Y"), noting the primary. ---
+#   xrandr active line forms:
+#     eDP-1 connected primary 1920x1080+0+0 ...   ($3 == "primary", geo in $4)
+#     DP-2  connected 2560x1440+1920+0 ...        (geo in $3)
+#     HDMI-1 connected (normal left ...)           (disabled output: no geo)
+monitors=()
+primary_idx=0
+i=0
+while read -r flag geo; do
+  [ -n "$geo" ] || continue
+  monitors+=("$geo")
+  [ "$flag" = "P" ] && primary_idx=$i
+  i=$((i+1))
+done < <(xrandr --query | awk '
+  / connected/ {
+    prim = ($3 == "primary") ? "P" : "-"
+    for (f = 1; f <= NF; f++)
+      if ($f ~ /^[0-9]+x[0-9]+\+(-?[0-9]+)\+(-?[0-9]+)$/) { print prim, $f; break }
+  }')
+[ "${#monitors[@]}" -gt 0 ] || exit 0
+
+geo_re='^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$'
+
+# Decompose the chosen "home" monitor (primary if any, else first).
+[[ "${monitors[$primary_idx]}" =~ $geo_re ]] || exit 0
+home_mx=${BASH_REMATCH[3]}; home_my=${BASH_REMATCH[4]}
+home_mw=${BASH_REMATCH[1]}; home_mh=${BASH_REMATCH[2]}
+
+# Test whether point (px,py) is inside monitor geometry token $1.
+inside() {
+  local geo="$1" px=$2 py=$3
+  [[ "$geo" =~ $geo_re ]] || return 1
+  local mw=${BASH_REMATCH[1]} mh=${BASH_REMATCH[2]} mx=${BASH_REMATCH[3]} my=${BASH_REMATCH[4]}
+  [ "$px" -ge "$mx" ] && [ "$px" -lt $((mx + mw)) ] && \
+  [ "$py" -ge "$my" ] && [ "$py" -lt $((my + mh)) ]
+}
+
+# --- 2. Scan every window; rescue the stranded floating ones. ---
+#   wmctrl -lG columns:  ID  desktop  x  y  w  h  host  title...
+rescued=0
+while read -r wid desk gx gy gw gh _host _title; do
+  [[ "$wid" =~ ^0x ]] || continue
+  [[ "$gw" =~ ^[0-9]+$ && "$gh" =~ ^[0-9]+$ && "$gw" -gt 0 && "$gh" -gt 0 ]] || continue
+  [ "$desk" = "-1" ] && continue                       # panel/dock/desktop widgets
+
+  # Skip special window types and states xfwm4 already manages.
+  wstate=$(xprop -id "$wid" _NET_WM_STATE 2>/dev/null || true)
+  case "$wstate" in
+    *_NET_WM_STATE_FULLSCREEN*|*_NET_WM_STATE_MAXIMIZED*) continue ;;
+  esac
+  wtype=$(xprop -id "$wid" _NET_WM_WINDOW_TYPE 2>/dev/null || true)
+  case "$wtype" in
+    *_TYPE_DESKTOP*|*_TYPE_DOCK*) continue ;;
+  esac
+
+  cx=$((gx + gw / 2)); cy=$((gy + gh / 2))
+  onscreen=0
+  for geo in "${monitors[@]}"; do
+    if inside "$geo" "$cx" "$cy"; then onscreen=1; break; fi
+  done
+  [ "$onscreen" -eq 1 ] && continue                    # already visible — leave it
+
+  # Stranded: slide it onto the home monitor. Keep its size + vertical row,
+  # cascade horizontally so successive rescues don't fully overlap, and clamp
+  # so the title bar stays reachable.
+  nx=$((home_mx + 32 + (rescued % 6) * 28))
+  ny=$gy
+  [ "$ny" -lt "$home_my" ] && ny=$home_my
+  : $((maxy = home_my + home_mh - 96)); [ "$ny" -gt "$maxy" ] && ny=$maxy
+
+  wid_dec=$((wid))                                     # xdotool wants decimal
+  if ! xdotool windowmove "$wid_dec" "$nx" "$ny" 2>/dev/null; then
+    wmctrl -i -r "$wid" -e "0,$nx,$ny,$gw,$gh" 2>/dev/null || true
+  fi
+  rescued=$((rescued + 1))
+done < <(wmctrl -lG)
+
+exit 0

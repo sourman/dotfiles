@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+#
+# cursor-fix-apparmor — flip Cursor's AppArmor sandbox profiles to complain
+# mode so they stop denying unprivileged user namespaces (userns_create).
+#
+# WHY THIS EXISTS
+#   Cursor's agent / shell-exec sandbox needs unprivileged user namespaces.
+#   Cursor ships AppArmor profiles (cursor_sandbox, cursor_sandbox_agent_cli,
+#   cursor_sandbox_remote) in /etc/apparmor.d/cursor-sandbox in ENFORCE mode,
+#   which deny userns_create (EACCES). Under agent-loop load this thrashes the
+#   extension host → renderer main thread blocks >15s → RendererPing window
+#   reload (looks like a crash/freeze + reload). Putting the profiles in
+#   complain mode lets the sandbox through (it was failing anyway, so no real
+#   isolation lost) and the reloads stop.
+#
+#   See memory: cursor-apparmor-sandbox-userns.
+#
+# WHEN IT RUNS
+#   By hand, AFTER every `cursor update` / `apt upgrade cursor`. Cursor's
+#   installer re-ships the profile in enforce mode, so the fix is undone on
+#   each upgrade — re-run this. AppArmor applies the change live, so no Cursor
+#   restart is required (reload the window only if it's currently mid-freeze).
+#
+# PREREQ
+#   apparmor-utils (provides aa-complain) — NOT installed by default on Debian.
+#   The script will offer to install it if missing.
+set -u
+
+PROFILE=/etc/apparmor.d/cursor-sandbox
+
+# aa-complain lives in /usr/sbin — NOT on a normal user's PATH (only in sudo's
+# secure_path), so command -v falsely reports it missing. Resolve by absolute
+# path, falling back to a PATH search. If genuinely absent, offer to install it.
+AA_COMPLAIN=/usr/sbin/aa-complain
+if [ ! -x "$AA_COMPLAIN" ]; then
+  AA_COMPLAIN="$(command -v aa-complain || true)"
+fi
+if [ -z "$AA_COMPLAIN" ]; then
+  echo "!! aa-complain not found (needs the apparmor-utils package)."
+  printf "   Install it now with apt? [y/N] "
+  read -r ans
+  if [ "${ans:-}" = y ] || [ "${ans:-}" = Y ]; then
+    sudo apt-get update && sudo apt-get install -y apparmor-utils || exit 1
+    AA_COMPLAIN=/usr/sbin/aa-complain
+  else
+    echo "   Aborting. Run: sudo apt-get install apparmor-utils"
+    exit 1
+  fi
+fi
+
+# Must run as root (aa-complain edits /etc/apparmor.d and talks to the kernel).
+if [ "$(id -u)" -ne 0 ]; then
+  exec sudo "$0" "$@"
+fi
+
+if [ ! -f "$PROFILE" ]; then
+  echo "!! $PROFILE not found — Cursor not installed (or the profile path changed)."
+  exit 1
+fi
+
+echo ">> Setting $PROFILE to complain mode…"
+"$AA_COMPLAIN" "$PROFILE" || { echo ">> ✗ aa-complain failed."; exit 1; }
+
+# Verify all three cursor_sandbox* profiles landed in complain mode.
+still_enforcing=$(/usr/sbin/aa-status 2>/dev/null | sed -n '/enforce mode/,/complain mode/p' \
+  | grep -c 'cursor_sandbox')
+
+if [ "$still_enforcing" -eq 0 ]; then
+  echo ">> ✓ cursor_sandbox profiles now in complain mode. Instability should stop."
+  echo "   (No Cursor restart needed — AppArmor applies the change live.)"
+  exit 0
+else
+  echo ">> ⚠ $still_enforcing cursor_sandbox profile(s) still enforcing. Check: aa-status"
+  exit 1
+fi

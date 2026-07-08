@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""
+altshift-toggle — Windows-style Alt+Shift keyboard-layout switch for X11/XFCE.
+
+Switches the XKB group when BOTH Alt and Shift are held and then one of them is
+released WITHOUT any other key having been pressed in between.  If any other key
+(Tab, F, etc.) is pressed while both are held, the switch is suppressed
+("fail-state") — so Alt+Shift+Tab, Alt+Shift+F, Shift+Tab, Ctrl+Shift+T, ...
+all keep working exactly as before.
+
+Safety model (same idea as xcape, generalised to a *pair* of modifiers):
+  * Observes key events through the X RECORD extension — read-only.  It does NOT
+    grab any key, so it cannot interfere with another shortcut or passive grab.
+  * Runs as your normal user — no root, no /dev/input, no global keystroke log.
+    It only acts on Alt/Shift; everything else is ignored.
+  * Switches the layout by sending ISO_Next_Group via xdotool (XTest fake key).
+
+Run:      altshift-toggle [-v|--verbose]
+Autostart:~/.config/autostart/altshift-toggle.desktop
+Log:      ~/.local/state/altshift-toggle.log
+Stop:     pkill -f altshift-toggle
+"""
+
+import fcntl
+import os
+import sys
+import signal
+import subprocess
+import time
+
+from Xlib import X, XK, display
+from Xlib.ext import record
+
+# Switch the group via the XKB protocol (XkbLockGroup) rather than synthesizing
+# the ISO_Next_Group keysym — that keysym only exists in the keymap when a
+# grp: option binds a key to it, which we deliberately do not set.
+SWITCH_CMD = [os.path.expanduser("~/.local/bin/xkbgrp"), "toggle"]
+LOGPATH = os.path.expanduser("~/.local/state/altshift-toggle.log")
+VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
+
+def _resolve_syms(names):
+    """Integer keysyms for the given XK constant names (try both spellings).
+    We compare integers because XK.keysym_to_string() returns None for these
+    modifier symbols on some python-xlib builds."""
+    out = set()
+    for nm in names:
+        v = getattr(XK, nm, None)
+        if v is None:
+            v = getattr(XK, "XK_" + nm, None)
+        if v:
+            out.add(v)
+    return out
+
+ALT_SYMS = _resolve_syms(("Alt_L", "Alt_R"))
+SHIFT_SYMS = _resolve_syms(("Shift_L", "Shift_R"))
+
+# keycodes resolved at startup from the live keymap
+_alt_kcs = set()
+_shift_kcs = set()
+
+# fail-state machine (mirrors the Windows / Dragiyski 4-state algorithm)
+_state = {
+    "down": set(),    # keycodes physically held right now (dedupes autorepeat)
+    "alt": 0,         # number of Alt-family keys down
+    "shift": 0,       # number of Shift keys down
+    "armed": False,   # both Alt + Shift have been held together
+    "failed": False,  # an extra key was pressed while armed
+}
+
+_d = None        # the X display connection (used for RECORD)
+_ctx = None      # the RECORD context
+
+
+def log(msg):
+    try:
+        with open(LOGPATH, "a") as f:
+            f.write(time.strftime("%F %T ") + msg + "\n")
+    except Exception:
+        pass
+
+
+def switch_group():
+    log("SWITCH (Alt+Shift released, no intervening key)")
+    try:
+        subprocess.run(SWITCH_CMD, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=2)
+    except Exception as e:
+        log("switch error: %r" % e)
+
+
+def on_key(press, kc):
+    is_alt = kc in _alt_kcs
+    is_sh = kc in _shift_kcs
+
+    if not (is_alt or is_sh):
+        # any non-Alt/Shift key pressed while armed => the combo is "consumed"
+        # by a real shortcut (e.g. Tab) and must NOT switch the language.
+        if press and _state["armed"]:
+            _state["failed"] = True
+            if VERBOSE:
+                log("fail: intervening key while armed")
+        return
+
+    if press:
+        if kc in _state["down"]:
+            return                       # autorepeat / duplicate press
+        _state["down"].add(kc)
+        if is_alt:
+            _state["alt"] += 1
+        if is_sh:
+            _state["shift"] += 1
+        if _state["alt"] > 0 and _state["shift"] > 0 and not _state["armed"]:
+            _state["armed"] = True
+            _state["failed"] = False
+            if VERBOSE:
+                log("armed (both Alt+Shift held)")
+    else:  # release
+        if kc not in _state["down"]:
+            return
+        _state["down"].discard(kc)
+        if is_alt:
+            _state["alt"] = max(0, _state["alt"] - 1)
+        if is_sh:
+            _state["shift"] = max(0, _state["shift"] - 1)
+        # fire on the first release of Alt/Shift after a clean arm
+        if _state["armed"] and not _state["failed"]:
+            _state["armed"] = False
+            _state["failed"] = False
+            switch_group()
+        # full reset once every Alt and Shift is released
+        if _state["alt"] == 0 and _state["shift"] == 0:
+            _state["armed"] = False
+            _state["failed"] = False
+
+
+def build_keycodes(d):
+    """Collect every keycode whose symbol (any group/level) is an Alt or Shift."""
+    lo, hi = d.display.info.min_keycode, d.display.info.max_keycode
+    for kc in range(lo, hi + 1):
+        for idx in (0, 1, 2, 3):
+            try:
+                sym = d.keycode_to_keysym(kc, idx)
+            except Exception:
+                sym = 0
+            if not sym:
+                continue
+            if sym in ALT_SYMS:
+                _alt_kcs.add(kc)
+            elif sym in SHIFT_SYMS:
+                _shift_kcs.add(kc)
+    log("keycodes -> alt:%s shift:%s" % (sorted(_alt_kcs), sorted(_shift_kcs)))
+
+
+def callback(reply):
+    if reply.category != record.FromServer:
+        return
+    if reply.client_swapped:
+        return
+    # Parse raw xEvent structs (32 bytes each) directly. We avoid
+    # rq.EventField.parse_binary_value() because its signature changed across
+    # python-xlib versions; type lives at byte 0 and the keycode at byte 1 of
+    # each KeyPress/KeyRelease event, which is all we need.
+    data = bytes(reply.data)
+    off = 0
+    while off + 32 <= len(data):
+        etype = data[off]
+        if etype == X.KeyPress:
+            on_key(True, data[off + 1])
+        elif etype == X.KeyRelease:
+            on_key(False, data[off + 1])
+        off += 32
+
+
+def cleanup(*_):
+    # The X server frees the RECORD context when this client disconnects, so we
+    # just exit.  (Calling record_disable_context from inside the read loop can
+    # deadlock the same display it is running on.)
+    log("stopped")
+    os._exit(0)
+
+
+def main():
+    global _d, _ctx
+    os.makedirs(os.path.dirname(LOGPATH), exist_ok=True)
+    # single-instance guard: only one daemon may run per user
+    _lockfile = open(os.path.join(os.path.dirname(LOGPATH), "altshift-toggle.lock"), "w")
+    try:
+        fcntl.flock(_lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("another instance is already running; exiting")
+        sys.exit(0)
+    log("==== starting (verbose=%s, pid=%d) ====" % (VERBOSE, os.getpid()))
+    _d = display.Display()
+    build_keycodes(_d)
+    if not _alt_kcs or not _shift_kcs:
+        log("ERROR: could not locate Alt/Shift keycodes — aborting")
+        sys.exit(1)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    _ctx = _d.record_create_context(
+        0,
+        [record.AllClients],
+        [{
+            "core_requests": (0, 0),
+            "core_replies": (0, 0),
+            "ext_requests": (0, 0, 0, 0),
+            "ext_replies": (0, 0, 0, 0),
+            "delivered_events": (0, 0),
+            "device_events": (X.KeyPress, X.KeyRelease),
+            "errors": (0, 0),
+            "client_started": False,
+            "client_died": False,
+        }],
+    )
+    log("RECORD enabled — watching Alt+Shift")
+    _d.record_enable_context(_ctx, callback)   # blocks until disabled
+    _d.record_free_context(_ctx)
+    log("record loop ended")
+
+
+if __name__ == "__main__":
+    main()

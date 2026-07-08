@@ -1,9 +1,52 @@
-.cursor/*
-!.cursor/rules/
+# ============================================================================
+# Allowlist gitignore for home-dir git repo.
+# Ignore everything by default, un-ignore with ! what we track.
+# ============================================================================
+
+# Ignore everything at top level.
+/*
+
+# --- dotfiles we manage ---
+!.bashrc
+!.bash_aliases
+!.bash_functions
+!.profile
+!.gitconfig
+!.tmux.conf
+!.vimrc
+!.gitignore
+!README.md
+
+# --- Cursor: do NOT re-include .cursor/ wholesale. The nested
+# .cursor/.gitignore (Cursor-managed) un-ignores plugins/projects/cache,
+# which would leak thousands of files. Instead, explicitly allow ONLY the
+# subdirs we want by referencing them with a leading .cursor/ prefix.
+# This bypasses the nested .gitignore entirely since these paths match
+# at the root level.
 !.cursor/commands/
+!.cursor/rules/
 !.cursor/tools/
-!.cursor/commands/**
-!.cursor/rules/**
-!.cursor/tools/**
+
+# --- Vim (track spell dict + autoload, ignore vim-plug's cloned plugins) ---
+!.vim/
+.vim/plugged/
+!.vscode/
+
+# --- scripts (version-controlled text scripts, on PATH via .bashrc) ---
+# Re-include only .local/scripts/ — ignore bin (binaries), lib (site-packages), etc.
+!.local/
+.local/*
+!.local/scripts/
+
+# --- WSL-era configs (kept for history; harmless on Debian) ---
+!.wslconfig
+!wsl.conf
+!.windows.cursor.settings.json
+
+# ============================================================================
+# Explicit ignores (defense in depth).
+# ============================================================================
 .bash_history
 .bash_logout
+.ICEauthority
+.Xauthority

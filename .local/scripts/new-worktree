@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# Create a new git worktree and copy gitignored secrets + (by default) your
+# dirty working state so you can immediately keep working in the new tree.
+#
+# Operates on whatever repo you're currently in — run it from inside any repo
+# or any worktree of one. Branch name is used verbatim as the worktree folder
+# name (slashes nest: feat/x -> parent/feat/x).
+#
+# Usage:
+#   new-worktree [OPTIONS] <branch-name> [parent-dir]
+#
+# Options:
+#   --base <ref>       Base the worktree on <ref> instead of current HEAD.
+#                      Example: --base origin/main
+#   --clean            Do NOT copy dirty working state (modified/untracked files).
+#                      Secret files are still copied (use --no-secrets to skip).
+#   --no-untracked     Copy modified tracked files but NOT untracked files.
+#   --no-secrets       Do NOT copy gitignored .env* / *signing_key*.json files.
+#   -h, --help         Show this help.
+#
+# Default parent-dir is ~/.cursor/worktrees/<repo-name>/ (for Cursor visibility).
+#
+# Default behavior (no flags): base = current HEAD, copy dirty state + secrets.
+# The classic "continue my WIP in a fresh worktree" workflow.
+#
+# Examples:
+#   new-worktree feat/ui-polishing              # base = HEAD, copy WIP + secrets
+#   new-worktree --base origin/main feat/x      # base = remote main
+#   new-worktree --clean feat/x                 # pristine checkout, secrets only
+#   new-worktree --no-secrets feat/x            # for sharing/cloning
+#   new-worktree feat/x ../worktrees            # custom parent dir
+
+set -euo pipefail
+
+usage() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# --- arg parsing ---
+BASE_REF=""
+COPY_DIRTY=true
+COPY_UNTRACKED=true
+COPY_SECRETS=true
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --base)         BASE_REF="$2"; shift 2;;
+    --clean)        COPY_DIRTY=false; shift;;
+    --no-untracked) COPY_UNTRACKED=false; shift;;
+    --no-secrets)   COPY_SECRETS=false; shift;;
+    -h|--help)      usage 0;;
+    --)             shift; break;;
+    -*)             echo "unknown option: $1" >&2; usage 1;;
+    *)              break;;
+  esac
+done
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  usage 1
+fi
+
+BRANCH="$1"
+
+# --- helpers ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+info()  { echo -e "${CYAN}›${NC} $*"; }
+ok()    { echo -e "${GREEN}✓${NC} $*"; }
+warn()  { echo -e "${YELLOW}!${NC} $*"; }
+die()   { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
+
+# --- resolve repo + sources ---
+# WT_ROOT:    the working tree we were invoked from — source of dirty state.
+# SECRET_SRC: the primary checkout owning .git metadata — source of secrets.
+#             These differ when invoked from a linked worktree; identical otherwise.
+WT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" \
+  || die "not inside a git repository (cwd: $(pwd))"
+
+GIT_COMMON_REL="$(git rev-parse --git-common-dir 2>/dev/null)"
+GIT_COMMON_ABS="$(cd "$WT_ROOT" && cd "$GIT_COMMON_REL" && pwd)"
+SECRET_SRC="$(dirname "$GIT_COMMON_ABS")"
+
+# Base ref: default to current HEAD so the worktree continues from where you are.
+if [ -z "$BASE_REF" ]; then
+  BASE_REF="$(git -C "$WT_ROOT" rev-parse HEAD)" \
+    || die "could not resolve current HEAD"
+  BASE_DESC="$(git -C "$WT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+  BASE_DESC="$BASE_DESC @ $(git -C "$WT_ROOT" rev-parse --short HEAD)"
+else
+  # Resolve the flag value for display + worktree base.
+  git -C "$WT_ROOT" rev-parse --verify "$BASE_REF" >/dev/null 2>&1 \
+    || die "base ref '$BASE_REF' does not exist"
+  BASE_DESC="$BASE_REF"
+fi
+
+# Parent dir. Default places worktrees under ~/.cursor/worktrees/<repo-name>/
+# so they appear in Cursor's worktree picker UI. Falls back to a sibling
+# dotdir if ~/.cursor/worktrees is unavailable.
+REPO_NAME="$(basename "$SECRET_SRC")"
+if [ -d "$HOME/.cursor/worktrees" ]; then
+  DEFAULT_PARENT="$HOME/.cursor/worktrees/$REPO_NAME"
+else
+  DEFAULT_PARENT="$(dirname "$SECRET_SRC")/.${REPO_NAME}-worktrees"
+fi
+if [ "$#" -eq 2 ]; then
+  PARENT_DIR="$(cd "$2" 2>/dev/null && pwd || (mkdir -p "$2" && cd "$2" && pwd))" \
+    || die "could not access or create parent-dir '$2'"
+else
+  PARENT_DIR="$DEFAULT_PARENT"
+fi
+WORKTREE_PATH="$PARENT_DIR/$BRANCH"
+
+# --- pre-flight ---
+if git -C "$WT_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  die "branch '$BRANCH' already exists locally"
+fi
+if [ -e "$WORKTREE_PATH" ]; then
+  die "path '$WORKTREE_PATH' already exists"
+fi
+
+# --- create worktree ---
+info "base: $BASE_DESC"
+info "creating worktree at $WORKTREE_PATH on branch $BRANCH"
+git -C "$WT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "${BASE_REF}"
+
+# --- copy dirty working state (modified + untracked, minus build artifacts) ---
+# Build-artifact dirs that should never be carried over even when not gitignored.
+BUILD_ARTIFACTS='node_modules|dist|build|\.next|coverage|\.turbo|out|target|\.cache'
+
+if [ "$COPY_DIRTY" = true ]; then
+  info "copying dirty working state from $WT_ROOT"
+  COPIED_DIRTY=0
+
+  # Porcelain v1, NUL-separated, no renames. Each record: XY<space>PATH.
+  # X/Y encode status (e.g. " M" = modified, "??" = untracked).
+  while IFS= read -r -d '' record; do
+    status="${record:0:2}"
+    path="${record:3}"
+
+    # Filter untracked files unless --no-untracked.
+    if [ "$COPY_UNTRACKED" = false ] && [ "$status" = "??" ]; then
+      continue
+    fi
+
+    # Skip build artifacts (matches path itself or any ancestor dir).
+    # path may have a trailing slash for untracked dirs; strip it for the test.
+    check_path="${path%/}"
+    if echo "$check_path" | grep -qE "^($BUILD_ARTIFACTS)(/|\$)"; then
+      continue
+    fi
+
+    src="$WT_ROOT/$path"
+    dst="$WORKTREE_PATH/$path"
+    if [ -e "$src" ]; then
+      mkdir -p "$(dirname "$dst")"
+      cp -r "$src" "$dst"
+      COPIED_DIRTY=$((COPIED_DIRTY + 1))
+    fi
+  done < <(git -C "$WT_ROOT" status --porcelain --no-renames -z)
+
+  if [ "$COPIED_DIRTY" -eq 0 ]; then
+    warn "no modified or untracked files to copy (working tree clean)"
+  else
+    ok "copied $COPIED_DIRTY dirty file/dir(s)"
+  fi
+else
+  info "skipping dirty state (--clean)"
+fi
+
+# --- copy gitignored secrets ---
+# A file is copied iff (a) it looks like a secret file, AND (b) git reports it
+# as ignored. Tracked .env / *.example come via the checkout and are skipped.
+# Never reads or prints file contents.
+#
+# Pattern rationale: matches both dotfile (.env, .env.local) and non-dotfile
+# (secrets.env, prod.env) conventions, plus signing keys.
+secret_looks_like() {
+  case "$(basename "$1")" in
+    .env|.env.*)        return 0;;
+    *.env|*.env.*)      return 0;;
+    *signing_key*.json) return 0;;
+    *)                  return 1;;
+  esac
+}
+export -f secret_looks_like
+
+if [ "$COPY_SECRETS" = true ]; then
+  info "scanning $SECRET_SRC for gitignored env / signing-key files"
+  SECRETS_COPIED=0
+  while IFS= read -r -d '' src; do
+    rel="${src#"$SECRET_SRC"/}"
+    # Defensive: skip if git actually tracks it (check-ignore can return 0 on
+    # negatively-matched patterns in some edge cases).
+    if git -C "$SECRET_SRC" ls-files --error-unmatch "$rel" >/dev/null 2>&1; then
+      continue
+    fi
+    dst="$WORKTREE_PATH/$rel"
+    mkdir -p "$(dirname "$dst")"
+    cp -p "$src" "$dst"
+    ok "copied $rel"
+    SECRETS_COPIED=$((SECRETS_COPIED + 1))
+  done < <(
+    cd "$SECRET_SRC"
+    find . -type f \
+      \( -name '.env*' -o -name '*.env' -o -name '*.env.*' -o -name '*signing_key*.json' \) \
+      -not -path './node_modules/*' \
+      -not -path './.git/*' \
+      -not -path './.cursor/*' \
+      -not -path './.venv/*' \
+      -print0 2>/dev/null | while IFS= read -r -d '' candidate; do
+        rel="${candidate#./}"
+        if git check-ignore -q "$rel" 2>/dev/null; then
+          printf '%s/%s\0' "$SECRET_SRC" "$rel"
+        fi
+      done
+  )
+  if [ "$SECRETS_COPIED" -eq 0 ]; then
+    warn "no gitignored secret files found in $SECRET_SRC"
+  else
+    ok "copied $SECRETS_COPIED gitignored secret file(s)"
+  fi
+else
+  info "skipping secrets (--no-secrets)"
+fi
+
+# --- isolate local Supabase (container + port isolation per worktree) ---
+# Only when the repo has supabase/config.toml. The CLI namespaces Docker
+# containers by project_id and binds to fixed default ports, so without
+# isolation a worktree sees the main repo's stack as "already running."
+# We rewrite config.toml IN THE WORKTREE ONLY via git skip-worktree so the
+# committed file in the main repo is never touched and the changes never
+# appear in git status/commit here.
+SB_CONFIG="$WORKTREE_PATH/supabase/config.toml"
+if [ -f "$SB_CONFIG" ]; then
+  info "isolating local Supabase stack"
+
+  # Deterministic port offset from branch name (100-2000, multiples of 100).
+  # main/master always 0 (defaults). Keeps ports below ~56400 (Spotify range).
+  sb_offset() {
+    local branch="$1"
+    case "$branch" in
+      main|master) echo 0; return;;
+    esac
+    # md5 hash -> take first 8 hex chars -> int -> (mod 20 + 1) * 100
+    local h
+    h=$(printf '%s' "$branch" | md5sum | cut -c1-8)
+    local n=$(( 16#$h % 20 + 1 ))
+    echo $(( n * 100 ))
+  }
+
+  # Check if a TCP port is in use (IPv4 127.0.0.1). Returns 0 if in use.
+  port_in_use() { ss -ltn "127.0.0.1:$1" 2>/dev/null | grep -q ":$1" ; }
+
+  SANITIZED_BRANCH=$(printf '%s' "$BRANCH" | tr -c 'a-zA-Z0-9' '-' | tr -s '-' '-' | sed 's/^-//;s/-$//' | tr '[:upper:]' '[:lower:]' | cut -c1-50)
+  REPO_SLUG=$(basename "$SECRET_SRC" | tr -c 'a-zA-Z0-9' '-' | tr -s '-' '-' | sed 's/^-//;s/-$//' | tr '[:upper:]' '[:lower:]' | cut -c1-30)
+  SB_PROJECT_ID="${REPO_SLUG}-${SANITIZED_BRANCH}"
+
+  PREFERRED_OFFSET=$(sb_offset "$BRANCH")
+  OFFSET=$PREFERRED_OFFSET
+
+  if [ "$PREFERRED_OFFSET" -gt 0 ]; then
+    # Scan for a free offset if the preferred one is bound.
+    FOUND=""
+    for try in "$PREFERRED_OFFSET" $(seq 100 100 2000); do
+      [ "$try" -eq "$PREFERRED_OFFSET" ] && [ -n "$FOUND" ] && continue
+      if ! port_in_use $(( 54321 + try )) && ! port_in_use $(( 54322 + try )); then
+        FOUND=$try; break
+      fi
+    done
+    if [ -z "$FOUND" ]; then
+      warn "no free Supabase port range found (100-2000); skipping isolation"
+    else
+      OFFSET=$FOUND
+    fi
+  fi
+
+  if [ -n "$OFFSET" ]; then
+    # Hide config.toml changes from git in this worktree only (skip-worktree
+    # is per-worktree; the main repo's copy is untouched).
+    git -C "$WORKTREE_PATH" update-index --skip-worktree supabase/config.toml
+
+    # Patch project_id and inject port overrides.
+    # 1. Replace project_id.
+    sed -i "s/^project_id = .*/project_id = \"$SB_PROJECT_ID\"/" "$SB_CONFIG"
+
+    # 2. Append port overrides for all services.
+    cat >> "$SB_CONFIG" <<EOF
+
+# --- WORKTREE-LOCAL OVERRIDES (hidden via git skip-worktree) ---
+# Generated by new-worktree for isolated local Supabase. Do not commit;
+# git update-index --no-skip-worktree supabase/config.toml to reveal.
+[api]
+port = $(( 54321 + OFFSET ))
+[db]
+port = $(( 54322 + OFFSET ))
+shadow_port = $(( 54320 + OFFSET ))
+[db.pooler]
+port = $(( 54329 + OFFSET ))
+[studio]
+port = $(( 54323 + OFFSET ))
+[inbucket]
+port = $(( 54324 + OFFSET ))
+[analytics]
+port = $(( 54327 + OFFSET ))
+[edge_runtime]
+inspector_port = $(( 8083 + OFFSET ))
+EOF
+    if [ "$PREFERRED_OFFSET" -ne "$OFFSET" ]; then
+      ok "Supabase isolated: project_id=$SB_PROJECT_ID, ports +$OFFSET (preferred +$PREFERRED_OFFSET was busy)"
+    else
+      ok "Supabase isolated: project_id=$SB_PROJECT_ID, ports +$OFFSET"
+    fi
+  fi
+fi
+
+# --- mcporter MCP baseline (worktrees access MCPs via mcporter, not Cursor) ---
+# Cursor does not load .cursor/mcp.json from worktree dirs registered via
+# move_agent_to_root — only from the original workspace. mcporter reads
+# .cursor/mcp.json from cwd and shares OAuth tokens via ~/.mcporter/credentials.json,
+# so a worktree-local config/mcporter.json pins the right targets while reusing
+# auth from the parent. config/ is gitignored in most repos.
+MCP_SRC="$WORKTREE_PATH/.cursor/mcp.json"
+MCPORTER_CONFIG="$WORKTREE_PATH/config/mcporter.json"
+if [ -f "$MCP_SRC" ] && command -v mcporter >/dev/null 2>&1; then
+  info "writing mcporter baseline (worktree MCP access via mcporter)"
+  mkdir -p "$(dirname "$MCPORTER_CONFIG")"
+
+  # mcporter auto-loads .cursor/mcp.json from cwd, so config/mcporter.json only
+  # needs the worktree-specific overrides. The schema matches Cursor's: top-level
+  # "mcpServers". If we know this worktree's local Supabase port, override
+  # supabase-local to point at it.
+  SB_LOCAL_PORT=""
+  if [ -n "$OFFSET" ]; then
+    SB_LOCAL_PORT=$(( 54321 + OFFSET ))
+  fi
+
+  if [ -n "$SB_LOCAL_PORT" ]; then
+    cat > "$MCPORTER_CONFIG" <<EOF
+{
+  "mcpServers": {
+    "supabase-local": {
+      "url": "http://localhost:${SB_LOCAL_PORT}/mcp"
+    }
+  }
+}
+EOF
+  else
+    echo '{"mcpServers":{}}' > "$MCPORTER_CONFIG"
+  fi
+  ok "wrote config/mcporter.json"
+
+  # Health check: list servers, surface auth-required ones.
+  info "checking MCP server health via mcporter"
+  MCPORTER_OUT=$(mcporter list --root "$WORKTREE_PATH" 2>&1 || true)
+  if printf '%s' "$MCPORTER_OUT" | grep -q 'healthy\|tools'; then
+    AUTH_REQUIRED=$(printf '%s' "$MCPORTER_OUT" | grep -oE "auth '[^']+'" || true)
+    if [ -n "$AUTH_REQUIRED" ]; then
+      warn "some MCP servers need auth (OAuth shared via ~/.mcporter/credentials.json):"
+      printf '%s\n' "$AUTH_REQUIRED" | while IFS= read -r line; do
+        echo "    mcporter auth ${line#* }"
+      done
+    else
+      ok "all MCP servers reachable"
+    fi
+  else
+    warn "mcporter health check had issues — run 'mcporter list' after cd to verify"
+  fi
+elif [ -f "$MCP_SRC" ] && ! command -v mcporter >/dev/null 2>&1; then
+  warn ".cursor/mcp.json found but mcporter not on PATH — MCP access via Cursor only"
+fi
+
+# --- summary ---
+echo ""
+ok "worktree ready: $WORKTREE_PATH"
+echo -e "  ${CYAN}branch:${NC}  $BRANCH"
+echo -e "  ${CYAN}base:${NC}    $BASE_DESC"
+echo ""
+echo -e "  ${YELLOW}next:${NC}"
+echo -e "    cd $WORKTREE_PATH"
+echo -e "    bun install   # or: npm ci / pnpm install"
+if [ -n "$OFFSET" ]; then
+echo -e "    ${CYAN}# local Supabase (isolated):${NC}"
+echo -e "    npx supabase start   # ports +$OFFSET (API $(( 54321 + OFFSET )))"
+echo -e "    npx supabase status  # see all ports"
+fi
+if [ -f "$MCPORTER_CONFIG" ]; then
+echo -e "    ${CYAN}# MCP access (via mcporter, not Cursor):${NC}"
+echo -e "    mcporter list        # see available servers"
+echo -e "    mcporter call linear.list_issues limit:1"
+fi
+echo -e "    bun run dev   # or whatever the repo's dev command is"

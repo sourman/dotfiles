@@ -1,0 +1,3 @@
+#!/bin/sh
+# Launch Discord (installed as a Flatpak) as a native-looking `discord` command.
+exec flatpak run com.discordapp.Discord "$@"

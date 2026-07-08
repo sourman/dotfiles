@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Custom power/session menu. Text-only (rofi font is Inter, no nerd glyphs).
+# Uses xflock4 to lock (loginctl lock-session is dead on this build per notes),
+# and systemctl for the system actions (allowed for the active local session
+# via polkit/logind). Confirms irreversible actions.
+set -o pipefail
+
+choice=$(printf '%s\n' \
+  "Lock screen" \
+  "Suspend" \
+  "Log out" \
+  "Reboot" \
+  "Shut down" \
+  | rofi -dmenu -i -no-custom -selected-row 0 -p Power \
+         -theme-str 'window {width: 16%;} listview {lines: 5;}' 2>/dev/null)
+[[ -z "$choice" ]] && exit 0
+
+confirm() {  # $1 = label ; returns 0 if user confirms
+  local ans
+  ans=$(printf 'No\nYes\n' | rofi -dmenu -i -no-custom -p "Confirm: $1?" \
+        -theme-str 'window {width: 18%;} listview {lines: 2;}' 2>/dev/null)
+  [[ "$ans" == "Yes" ]]
+}
+
+case "$choice" in
+  "Lock screen") exec xflock4 ;;
+  "Suspend")     systemctl suspend ;;
+  "Log out")
+    confirm "Log out" && xfce4-session-logout --logout ;;
+  "Reboot")
+    confirm "Reboot" && systemctl reboot ;;
+  "Shut down")
+    confirm "Shut down" && systemctl poweroff ;;
+esac

@@ -105,5 +105,8 @@ if [ -f ~/.bash_functions ]; then
     . ~/.bash_functions
 fi
 
+# Scripts dir (version-controlled text scripts, tracked in dotfiles repo).
+[ -d "$HOME/.local/scripts" ] && PATH="$HOME/.local/scripts:$PATH"
+
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"

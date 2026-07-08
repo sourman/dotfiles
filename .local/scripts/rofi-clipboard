@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# rofi-clipboard — pick an item from CopyQ history and paste it immediately
+# into the window that had focus before rofi opened.  Bound to Super+V.
+#
+# CopyQ runs headless as the history backend (see
+# ~/.config/autostart/copyq.desktop); this wrapper only renders its history
+# through rofi — so it inherits the Graphite-Dark rofi theme — and simulates
+# Ctrl+V so the paste is instant, the way Windows' Win+V behaves.
+set -uo pipefail
+
+MAX_ITEMS="${ROFI_CLIPBOARD_MAX:-30}"
+
+# Make sure the CopyQ daemon is up (autostart normally handles this).
+if ! pgrep -x copyq >/dev/null 2>&1; then
+    ( setsid copyq >/dev/null 2>&1 & )
+    for _ in $(seq 1 30); do copyq count >/dev/null 2>&1 && break; sleep 0.1; done
+fi
+
+# Dump history: one line per item, newest first, each collapsed to a single
+# line and truncated, so rofi's selected index maps 1:1 to a CopyQ row.
+#
+# Image-only items have no text/plain payload (read(i) is empty), so they
+# used to render as blank lines — detect them by their image/* MIME and show
+# a "[image] PNG (N KB)" placeholder instead. select/paste already handles
+# the image MIME, so only the display needs this.
+#
+# NB: CopyQ's `eval` unescapes backslashes BEFORE the JS engine parses, so a
+# literal "\n" in the script becomes a real newline in the source and breaks
+# it. Build newline/tab/cr via String.fromCharCode instead.
+mapfile -t ITEMS < <(copyq eval '
+var nl=String.fromCharCode(10), cr=String.fromCharCode(13), tb=String.fromCharCode(9);
+var n=Math.min('"$MAX_ITEMS"', size());
+var imgMimes=["image/png","image/jpeg","image/webp","image/bmp","image/gif","image/tiff"];
+function label(i){
+  var t=""+read(i);
+  if(t.length===0){
+    for(var k=0;k<imgMimes.length;k++){
+      var d=""+read(imgMimes[k],i);
+      if(d.length>0){
+        var kb=Math.round(d.length/1024);
+        var ext=imgMimes[k].split("/")[1].toUpperCase();
+        return "[image] "+ext+" ("+kb+" KB)";
+      }
+    }
+    return "[empty]";
+  }
+  t=t.split(cr).join("").split(nl).join(" ").split(tb).join(" ");
+  if(t.length>160) t=t.substring(0,160)+String.fromCharCode(8230);
+  return t;
+}
+for (var i=0;i<n;++i){ print(label(i)+nl); }
+' 2>/dev/null)
+
+if [ "${#ITEMS[@]}" -eq 0 ] || [ -z "${ITEMS[0]:-}" ]; then
+    notify-send -u low -t 2000 "Clipboard" "History is empty"
+    exit 0
+fi
+
+# -format i prints the 0-based index of the chosen line, which equals the
+# CopyQ row because every item is exactly one display line.
+SEL=$(printf '%s\n' "${ITEMS[@]}" | rofi -dmenu -i -format i -p "📋 Paste" -selected-row 0)
+[ -z "$SEL" ] && exit 0          # Esc / no selection
+
+# Move the chosen item to the clipboard (and to the top of history).
+copyq select "$SEL" >/dev/null 2>&1
+
+# Let the X selection settle, then paste into the previously-focused window.
+# --clearmodifiers guards against Super still being held from the keybinding.
+sleep 0.06
+xdotool key --clearmodifiers ctrl+v

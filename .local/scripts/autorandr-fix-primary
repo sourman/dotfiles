@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# fix-primary — repair the RandR "primary" flag when it is left stranded on a
+# disconnected output after an undock, then restart Plank so it follows.
+# Idempotent: if the current primary is still a *connected* output, this is a
+# no-op (a working docked setup is never disturbed).
+#
+# WHY THIS EXISTS
+#   XFCE's display handling does not always migrate the primary flag back to the
+#   laptop panel when an external monitor is unplugged — it can leave it pinned
+#   to the now-disconnected output (e.g. DP-2). Plank uses monitor='' ("follow
+#   primary"), so a primary stranded on a dead output makes the dock render onto
+#   a non-existent screen and become invisible. This script moves primary to a
+#   connected output whenever it finds it stranded, and restarts Plank to make
+#   it relocate (Plank does not reliably move on a bare --primary flag flip).
+#
+# WHEN IT RUNS
+#   Via ~/.config/autorandr/postswitch after every autorandr profile switch
+#   (udev hotplug → autorandr.service, and manual display-dock/undock). Safe to
+#   run by hand:  fix-primary
+#
+# ALGORITHM
+#   1. Parse xrandr for the current *connected* primary and the set of
+#      connected outputs.
+#   2. If the primary output is connected → exit 0 (nothing to fix).
+#   3. Otherwise pick the highest-priority connected output, make it primary,
+#      and restart Plank.
+#   Priority order (external dock outputs first, laptop panel last):
+#       DP-2  DP-1  HDMI-2  HDMI-1  eDP-1
+set -u
+
+# --- session env (autorandr may invoke us as root via the system service) ---
+if [ "$(id -u)" = 0 ]; then
+  HOME2=/home/ahmed; UID2=1000
+else
+  HOME2="$HOME"; UID2="$(id -u)"
+fi
+export DISPLAY="${DISPLAY:-:0.0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME2/.Xauthority}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$UID2/bus}"
+
+command -v xrandr >/dev/null || exit 0
+
+# --- 1. Current primary output, but only if it is *connected*.
+#   xrandr emits both "connected" and "disconnected" lines; "$2=="connected""
+#   rejects the disconnected ones (whose $2 is "disconnected"). A disconnected
+#   output can still be tagged "primary", which is precisely the bug we fix.
+primary_out="$(xrandr --query | awk '$2=="connected" && $3=="primary" { print $1; exit }')"
+mapfile -t connected < <(xrandr --query | awk '$2=="connected" { print $1 }')
+
+is_connected() {
+  local o
+  for o in "${connected[@]}"; do [ "$o" = "$1" ] && return 0; done
+  return 1
+}
+
+# --- 2. Primary still live? Nothing to do (docked-and-working is a no-op). ---
+if [ -n "$primary_out" ] && is_connected "$primary_out"; then
+  exit 0
+fi
+
+# --- 3. Choose a new primary: first connected output in preference order. ---
+PRIORITY=(DP-2 DP-1 HDMI-2 HDMI-1 eDP-1)
+new_primary=""
+for pref in "${PRIORITY[@]}"; do
+  if is_connected "$pref"; then new_primary="$pref"; break; fi
+done
+# Fallback: first connected output in xrandr order if none of the above matched.
+if [ -z "$new_primary" ] && [ "${#connected[@]}" -gt 0 ]; then
+  new_primary="${connected[0]}"
+fi
+[ -n "$new_primary" ] || exit 0
+
+xrandr --output "$new_primary" --primary
+
+# --- 4. Restart Plank so it re-resolves its monitor onto the live primary. ---
+#   Run as the session user even when autorandr invoked us as root.
+relaunch_plank() {
+  if [ "$(id -u)" = 0 ]; then
+    pkill -u ahmed -x plank 2>/dev/null || true
+    setsid -f /usr/sbin/runuser -u ahmed -- env \
+      DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" \
+      DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+      plank </dev/null >/dev/null 2>&1
+  else
+    pkill -x plank 2>/dev/null || true
+    setsid -f plank </dev/null >/dev/null 2>&1
+  fi
+}
+command -v plank >/dev/null && relaunch_plank
+exit 0

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# rofi-emoji — searchable emoji picker, the Linux equivalent of Windows' Win+.
+#   Enter  -> insert the emoji into the focused window (copy + Ctrl+V)
+#   Alt+C  -> copy the emoji to the clipboard only
+#   Esc    -> cancel
+#
+# Uses rofi's -dmenu mode so it inherits the Graphite-Dark rofi theme.
+# Database: ~/.local/share/rofi-emoji/all_emojis.txt  (TSV: emoji  group  subgroup  name  keywords)
+set -uo pipefail
+
+DB="${ROFI_EMOJI_DB:-$HOME/.local/share/rofi-emoji/all_emojis.txt}"
+[ -r "$DB" ] || { notify-send -u critical "rofi-emoji" "Emoji DB not found: $DB"; exit 1; }
+
+# Build display lines on the fly: "emoji\tname (keyword keyword …)".
+# The emoji is the first tab field, so we extract it by cutting at the first
+# tab — works no matter how many code points (ZWJ sequences etc.) it spans.
+# rofi matches against the whole line, so name + keywords are all searchable.
+# Exit code: 0 = Enter, 10 = Alt+C (kb-custom-1), 1 = Esc.
+SEL=$(awk -F'\t' 'NF>=4 {
+        kw=$5; gsub(/ \| /, " ", kw);
+        if (kw=="") printf "%s\t%s\n", $1, $4;
+        else        printf "%s\t%s (%s)\n", $1, $4, kw;
+    }' "$DB" \
+    | rofi -dmenu -i -p "Emoji" -kb-custom-1 Alt+c)
+RC=$?
+[ -z "$SEL" ] && exit 0
+
+# Emoji = everything before the first tab.
+EMOJI="${SEL%%$'\t'*}"
+
+# Copy to clipboard (the insert path pastes from here).
+printf '%s' "$EMOJI" | xclip -selection clipboard
+
+case "$RC" in
+    10) # Alt+C: copy only
+        notify-send -u low -t 1500 "rofi-emoji" "Copied  $EMOJI"
+        ;;
+    *)  # Enter: insert into the previously-focused window
+        sleep 0.06
+        xdotool key --clearmodifiers ctrl+v
+        ;;
+esac

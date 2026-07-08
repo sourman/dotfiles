@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Turbo Whisper — voice dictation (Super+h to dictate). Detached launcher.
+APP="/home/ahmed/src/turbo-whisper/.venv/bin/turbo-whisper"
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/turbo-whisper/last.log"
+
+# Don't start a second instance.
+if pgrep -f "turbo-whisper/.venv/bin/turbo-whisper\$" >/dev/null 2>&1; then
+  echo "Turbo Whisper is already running."
+  exit 0
+fi
+
+mkdir -p "$(dirname "$LOG")"
+nohup setsid "$APP" >>"$LOG" 2>&1 </dev/null &
+echo "Turbo Whisper started. Press Super+h to dictate. Log: $LOG"

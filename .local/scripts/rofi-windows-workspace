@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# rofi-windows-workspace — rofi "script mode" backend that lists only the
+# windows on the CURRENT workspace and focuses the chosen one. Wired to the
+# 3-finger swipe-down gesture in libinput-gestures.conf.
+#
+# Rofi calls us with no args to get the list, then again with the selected row
+# text as $1 to activate it.
+set -uo pipefail
+
+MAP="${ROFI_WS_MAP:-$HOME/.cache/rofi-windows-workspace.map}"
+mkdir -p "$(dirname "$MAP")"
+
+# Numeric id of the currently active workspace.
+cur_ws() { wmctrl -d | awk '$2=="*"{print $1; exit}'; }
+
+if [ "$#" -eq 0 ]; then
+    # ---- list mode ----
+    cur="$(cur_ws)" || cur="0"
+    : > "$MAP"
+    # wmctrl -l layout: "<id> <desktop> <host> <title...>"
+    while read -r wid ws host title; do
+        [ "${ws:-}" = "$cur" ] || continue
+        [ -n "${title:-}" ] || continue
+        app="$(xprop -id "$wid" WM_CLASS 2>/dev/null \
+                | sed -n 's/.*", *"\([^"]*\)".*/\1/p' | head -1)"
+        if [ -n "${app:-}" ]; then
+            label="$title   ·   $app"
+        else
+            label="$title"
+        fi
+        printf '%s\n' "$label"
+        printf '%s\t%s\n' "$wid" "$label" >> "$MAP"
+    done < <(wmctrl -l)
+    [ -s "$MAP" ] || printf '(no other windows on this workspace)\n'
+    exit 0
+fi
+
+# ---- selection mode ----
+wid="$(awk -F'\t' -v k="$1" '$2==k{print $1; exit}' "$MAP" 2>/dev/null || true)"
+[ -n "${wid:-}" ] && wmctrl -i -a "$wid"

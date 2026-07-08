@@ -1,0 +1,13 @@
+#!/bin/sh
+# Undock: switch to the laptop-only layout in SOFTWARE, so the external display
+# can be physically unplugged safely. Hot-unplugging an *active* Thunderbolt/
+# USB-C display glitches the Intel driver and blacks the laptop panel; disabling
+# it first avoids that.
+#
+# Usage: press the keybinding (Super+U), wait for the external screen to go
+# blank, then unplug the cable.
+export DISPLAY="${DISPLAY:-:0.0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+
+autorandr --load default
