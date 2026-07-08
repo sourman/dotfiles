@@ -6,6 +6,13 @@
 # If not running interactively, don't do anything
 [ -z "$PS1" ] && return
 
+# ble.sh — must be the very FIRST thing (before any other readline/prompt setup)
+# so it can hook the line editor. --noattach defers actual attachment until the
+# end of the file (after starship). fish/zsh-style autosuggestions + syntax hl.
+if [[ $- == *i* ]] && [ -f "$HOME/.local/share/blesh/ble.sh" ]; then
+  source "$HOME/.local/share/blesh/ble.sh" --noattach
+fi
+
 # ============================================================================
 # BASH HISTORY CONFIGURATION
 # ============================================================================
@@ -53,7 +60,8 @@ fi
 #    ;;
 #esac
 
-# enable bash completion in interactive shells
+# enable bash completion in interactive shells (the framework; _completion_loader
+# becomes available for lazy per-command loading of the 1223 completion scripts)
 if ! shopt -oq posix; then
   if [ -f /usr/share/bash-completion/bash_completion ]; then
     . /usr/share/bash-completion/bash_completion
@@ -91,9 +99,10 @@ if [ -x /usr/lib/command-not-found -o -x /usr/share/command-not-found/command-no
 		fi
 	}
 fi
-gsutil-tree() { local bucket_path="$1"; bucket_path="${bucket_path#gs://}"; gsutil ls -r "gs://$bucket_path" | awk 'BEGIN { path[0] = "" } /:$/ { dir = substr($0, 1, length($0)-1); if (dir == ".") { depth = 0; path[0] = "" } else { depth = gsub(/\//, "/", dir); path[depth] = dir } if (depth > 0) { for (i = 1; i < depth; i++) printf "| "; printf "|____" dir; gsub(/.*\//, "", dir); print dir } } /^$/ { next } !/^[[:space:]]*$/ && !/:$/ { for (i = 0; i < depth; i++) printf "| "; print "|____" $0 }'; }
+# ============================================================================
+# SOURCE custom aliases, functions, then completions (order matters)
+# ============================================================================
 
-source /usr/share/bash-completion/completions/git
 # Source bash aliases if file exists
 if [ -f ~/.bash_aliases ]; then
     . ~/.bash_aliases
@@ -102,6 +111,12 @@ fi
 # Source bash functions if file exists
 if [ -f ~/.bash_functions ]; then
     . ~/.bash_functions
+fi
+
+# Source custom completions LAST (after bash-completion framework, aliases, and
+# functions are all loaded so it can clone completions onto aliases)
+if [ -f ~/.bash_completions ]; then
+    . ~/.bash_completions
 fi
 
 # ============================================================================
@@ -163,10 +178,18 @@ fi
 
 export PATH
 
-# ble.sh (syntax highlighting, auto-suggestions, menu completion) — source
-# early with --noattach so it's ready before starship; attach at the very end.
-if [[ $- == *i* ]] && [ -f "$HOME/.local/share/blesh/ble.sh" ]; then
-  source "$HOME/.local/share/blesh/ble.sh" --noattach
+# ============================================================================
+# fzf — wired through ble.sh integration modules (NOT `eval "$(fzf --bash)"`)
+# because fzf's own bind calls are swallowed by ble.sh's line editor. The modules
+# bind Ctrl-R/Ctrl-T/Alt-C into ble.sh's keymap. Plain-bash fallback if no ble.sh.
+# ============================================================================
+if [[ ${BLE_VERSION-} ]]; then
+  _ble_contrib_fzf_base=/usr/share/doc/fzf/examples   # Debian's fzf script location
+  ble-import integration/fzf-completion
+  ble-import integration/fzf-key-bindings
+elif [ -f /usr/share/doc/fzf/examples/key-bindings.bash ]; then
+  . /usr/share/doc/fzf/examples/key-bindings.bash
+  . /usr/share/doc/fzf/examples/completion.bash
 fi
 
 # Starship prompt (git-aware, nerd-font powerline) — overrides PS1 above

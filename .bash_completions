@@ -1,0 +1,52 @@
+# Custom TAB completions for Ahmed's aliases & functions.
+# Sourced from ~/.bashrc AFTER bash-completion, fzf, .bash_aliases, .bash_functions
+# are all loaded. Order matters: bash-completion defines _completion_loader.
+
+# ----------------------------------------------------------------------------
+# _alias_completion REAL_CMD ALIAS1 [ALIAS2 ...]
+# Make one or more aliases share a real command's full TAB completion.
+# Loads REAL_CMD's completion via bash-completion's lazy loader, then clones
+# its `complete` registration onto each alias. E.g. `gut`, `got`, ... complete
+# exactly like `git`.
+# ----------------------------------------------------------------------------
+_alias_completion() {
+    local real="$1"; shift
+    [ $# -eq 0 ] && return 0
+    type _completion_loader >/dev/null 2>&1 && _completion_loader "$real" 2>/dev/null
+    local comp
+    comp="$(complete -p "$real" 2>/dev/null)" || return 0
+    local opts="${comp% *}"                    # strip the trailing command name
+    # shellcheck disable=SC2086
+    eval "$opts" "$@" 2>/dev/null
+}
+
+# git typo-aliases -> full git completion (subcommands, branches, remotes, ...)
+_alias_completion git   gut ggit got gitt giot igt gti
+
+# docker typo-aliases -> full docker completion (containers, images, commands)
+_alias_completion docker docke dockerr docer dockeg dockef docked docket
+
+# pushy forwards "$@" to `git push` per remote -> reuse git completion (refspecs)
+_alias_completion git pushy
+
+# ----------------------------------------------------------------------------
+# ssh: plain TAB -> bash-completion's _ssh (options + ~/.ssh/config hosts);
+# `ssh **<TAB>` -> fzf fuzzy host picker.
+# fzf replaces ssh's completion (_fzf_complete_ssh) but, because bash-completion
+# is lazy-loaded, finds no original to delegate to on a plain TAB — so plain
+# `ssh <TAB>` would return nothing. This wrapper restores plain-TAB behavior by
+# calling bash-completion's _ssh directly, while still yielding to fzf for `**`.
+# ----------------------------------------------------------------------------
+_ssh_smart() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local trigger=${FZF_COMPLETION_TRIGGER-'**'}
+    if [[ $cur == *"$trigger" ]] && declare -F _fzf_complete_ssh >/dev/null 2>&1; then
+        _fzf_complete_ssh; return $?
+    fi
+    # Delegate to bash-completion's ssh completion — _comp_cmd_ssh reads
+    # ~/.ssh/config + known_hosts and completes options; it self-initializes
+    # via _comp_initialize so it's safe to call directly.
+    declare -F _comp_cmd_ssh >/dev/null 2>&1 || _completion_loader ssh 2>/dev/null
+    declare -F _comp_cmd_ssh >/dev/null 2>&1 && _comp_cmd_ssh "$@"
+}
+complete -F _ssh_smart ssh

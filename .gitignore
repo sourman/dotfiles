@@ -10,6 +10,7 @@
 !.bashrc
 !.bash_aliases
 !.bash_functions
+!.bash_completions
 !.profile
 !.gitconfig
 !.tmux.conf
