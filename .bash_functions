@@ -130,7 +130,12 @@ wt() {
         name="$(basename "$path")"
       fi
       echo "Removing worktree '$name'..."
-      git worktree remove "$path" && echo "Removed $path"
+      if git worktree remove "$path" 2>/dev/null; then
+        echo "Removed $path"
+      else
+        echo "Plain remove failed (likely untracked secrets from new-worktree) — retrying with --force..." >&2
+        git worktree remove --force "$path" && echo "Removed $path (forced)"
+      fi
       ;;
     prune)
       git worktree prune "$@"
