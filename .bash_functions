@@ -57,13 +57,25 @@ _wt_entries() {
 # Ctrl+R pattern: no preformatting, let fzf's display opts do the work).
 # --with-nth=1,2 shows name+branch; the full tab-separated line is returned
 # so we can cleanly extract field 3 (the path) with awk afterwards.
+#
+# ble.sh ESC fix: under ble.sh, the line editor can intercept the ESC key before
+# fzf sees it, making Escape do nothing. We explicitly detach ble.sh's decoder
+# before launching fzf and re-attach after, so fzf owns the terminal cleanly.
 _wt_fzf_path() {
-  local query="${1:-}"
+  local query="${1:-}" had_ble=0
+  if [[ ${BLE_VERSION-} ]] && declare -F ble/decode/detach >/dev/null 2>&1; then
+    had_ble=1; ble/decode/detach
+  fi
   _wt_entries \
     | fzf --query="$query" --prompt='worktree> ' \
           --delimiter='\t' --with-nth=1,2 --header='NAME  BRANCH' \
           --height=40% --min-height=20 --reverse \
     | awk -F'\t' '{print $3}'
+  local rc=$?
+  if (( had_ble )) && declare -F ble/decode/attach >/dev/null 2>&1; then
+    ble/decode/attach
+  fi
+  return $rc
 }
 
 wt() {
