@@ -50,3 +50,27 @@ _ssh_smart() {
     declare -F _comp_cmd_ssh >/dev/null 2>&1 && _comp_cmd_ssh "$@"
 }
 complete -F _ssh_smart ssh
+
+# ----------------------------------------------------------------------------
+# wt — worktree navigator (jump is the default).
+# First word completes subcommands + worktree names; second word (for go/rm)
+# completes worktree names too (for substring matching).
+# ----------------------------------------------------------------------------
+_wt_completion() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    # Subcommands that take a worktree name as their next arg
+    local subcmds="go list ls rm remove prune help -h --help"
+
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        # First arg: subcommands + all worktree names (since jump is default)
+        local names
+        names="$(_wt_entries 2>/dev/null | awk -F'\t' '{print $1}')"
+        COMPREPLY=( $(compgen -W "$subcmds $names" -- "$cur") )
+    else
+        # Subsequent args: worktree names only (for `wt go`, `wt rm`, etc.)
+        local names
+        names="$(_wt_entries 2>/dev/null | awk -F'\t' '{print $1}')"
+        COMPREPLY=( $(compgen -W "$names" -- "$cur") )
+    fi
+}
+complete -F _wt_completion wt
