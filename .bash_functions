@@ -53,14 +53,16 @@ _wt_entries() {
 }
 
 # fzf picker over worktree entries → echoes the chosen PATH (nothing if aborted)
-# Keep the path in the piped data (3rd tab field) but hide it from display with
-# --with-nth so fzf shows only name+branch; the full tab-delimited line is what
-# fzf outputs on selection, so we can still extract the path.
+# Feed raw "name<TAB>branch<TAB>path" rows straight through fzf (matching the
+# Ctrl+R pattern: no preformatting, let fzf's display opts do the work).
+# --with-nth=1,2 shows name+branch; the full tab-separated line is returned
+# so we can cleanly extract field 3 (the path) with awk afterwards.
 _wt_fzf_path() {
   local query="${1:-}"
   _wt_entries \
-    | fzf --query="$query" --prompt='worktree> ' --header='NAME  BRANCH' \
-          --delimiter='\t' --with-nth=1,2 --preview-window=hidden \
+    | fzf --query="$query" --prompt='worktree> ' \
+          --delimiter='\t' --with-nth=1,2 --header='NAME  BRANCH' \
+          --height=40% --min-height=20 --reverse \
     | awk -F'\t' '{print $3}'
 }
 
