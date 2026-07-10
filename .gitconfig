@@ -39,7 +39,7 @@
 [core]
 	safecrlf = false
 	autocrlf = input
-	editor = vim
+	editor = nvim
 [color]
     ui = auto
 [color "branch"]
@@ -64,3 +64,9 @@
 	smudge = git-lfs smudge -- %f
 [pull]
 	rebase = false
+[credential "https://github.com"]
+	helper = 
+	helper = !/usr/bin/gh auth git-credential
+[credential "https://gist.github.com"]
+	helper = 
+	helper = !/usr/bin/gh auth git-credential

@@ -33,6 +33,13 @@
 .vim/plugged/
 !.vscode/
 
+# --- Neovim (shares ~/.vimrc via an init.vim shim) ---
+!.config/
+.config/*
+!.config/nvim/
+.config/nvim/*
+!.config/nvim/init.vim
+
 # --- scripts (version-controlled text scripts, on PATH via .bashrc) ---
 # Re-include only .local/scripts/ — ignore bin (binaries), lib (site-packages), etc.
 !.local/
