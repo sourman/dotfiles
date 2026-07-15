@@ -5,6 +5,8 @@
 # Operates on whatever repo you're currently in — run it from inside any repo
 # or any worktree of one. Branch name is used verbatim as the worktree folder
 # name (slashes nest: feat/x -> parent/feat/x).
+# If the named branch already exists, it's checked out as-is instead of being
+# created (--base is ignored in that case).
 #
 # Usage:
 #   new-worktree [OPTIONS] <branch-name> [parent-dir]
@@ -39,12 +41,13 @@ usage() {
 
 # --- arg parsing ---
 BASE_REF=""
+BASE_REF_SET=false
 COPY_DIRTY=true
 COPY_UNTRACKED=true
 COPY_SECRETS=true
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --base)         BASE_REF="$2"; shift 2;;
+    --base)         BASE_REF="$2"; BASE_REF_SET=true; shift 2;;
     --clean)        COPY_DIRTY=false; shift;;
     --no-untracked) COPY_UNTRACKED=false; shift;;
     --no-secrets)   COPY_SECRETS=false; shift;;
@@ -114,17 +117,29 @@ fi
 WORKTREE_PATH="$PARENT_DIR/$BRANCH"
 
 # --- pre-flight ---
+# If the named branch already exists, check it out as-is instead of creating a
+# new one. We don't die here — that's the existing-branch checkout path.
+BRANCH_EXISTS=false
 if git -C "$WT_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
-  die "branch '$BRANCH' already exists locally"
+  BRANCH_EXISTS=true
 fi
 if [ -e "$WORKTREE_PATH" ]; then
   die "path '$WORKTREE_PATH' already exists"
 fi
 
 # --- create worktree ---
-info "base: $BASE_DESC"
-info "creating worktree at $WORKTREE_PATH on branch $BRANCH"
-git -C "$WT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "${BASE_REF}"
+if [ "$BRANCH_EXISTS" = true ]; then
+  if [ "$BASE_REF_SET" = true ]; then
+    warn "--base ignored: branch '$BRANCH' already exists, checking it out as-is"
+  fi
+  info "branch '$BRANCH' exists — checking it out"
+  git -C "$WT_ROOT" worktree add "$WORKTREE_PATH" "$BRANCH"
+  BASE_DESC="$BRANCH (existing)"
+else
+  info "base: $BASE_DESC"
+  info "creating worktree at $WORKTREE_PATH on branch $BRANCH"
+  git -C "$WT_ROOT" worktree add -b "$BRANCH" "$WORKTREE_PATH" "${BASE_REF}"
+fi
 
 # --- copy dirty working state (modified + untracked, minus build artifacts) ---
 # Build-artifact dirs that should never be carried over even when not gitignored.
@@ -233,6 +248,9 @@ fi
 # We rewrite config.toml IN THE WORKTREE ONLY via git skip-worktree so the
 # committed file in the main repo is never touched and the changes never
 # appear in git status/commit here.
+# Empty unless a local Supabase stack is isolated below (no supabase/config.toml
+# => stays unset-as-empty; guards the summary + mcporter sections under set -u).
+OFFSET=""
 SB_CONFIG="$WORKTREE_PATH/supabase/config.toml"
 if [ -f "$SB_CONFIG" ]; then
   info "isolating local Supabase stack"
@@ -251,31 +269,52 @@ if [ -f "$SB_CONFIG" ]; then
     echo $(( n * 100 ))
   }
 
-  # Check if a TCP port is in use (IPv4 127.0.0.1). Returns 0 if in use.
-  port_in_use() { ss -ltn "127.0.0.1:$1" 2>/dev/null | grep -q ":$1" ; }
+  # True if a TCP listener is bound to $1 on ANY interface. Docker publishes on
+  # 0.0.0.0, so we must NOT scope to 127.0.0.1 (that misses container ports
+  # entirely). Match ":<port>" followed by space or end-of-line to stay exact.
+  port_in_use() { ss -ltn 2>/dev/null | grep -qE ":$1( |\$)" ; }
 
   SANITIZED_BRANCH=$(printf '%s' "$BRANCH" | tr -c 'a-zA-Z0-9' '-' | tr -s '-' '-' | sed 's/^-//;s/-$//' | tr '[:upper:]' '[:lower:]' | cut -c1-50)
   REPO_SLUG=$(basename "$SECRET_SRC" | tr -c 'a-zA-Z0-9' '-' | tr -s '-' '-' | sed 's/^-//;s/-$//' | tr '[:upper:]' '[:lower:]' | cut -c1-30)
   SB_PROJECT_ID="${REPO_SLUG}-${SANITIZED_BRANCH}"
 
   PREFERRED_OFFSET=$(sb_offset "$BRANCH")
-  OFFSET=$PREFERRED_OFFSET
 
-  if [ "$PREFERRED_OFFSET" -gt 0 ]; then
-    # Scan for a free offset if the preferred one is bound.
-    FOUND=""
-    for try in "$PREFERRED_OFFSET" $(seq 100 100 2000); do
-      [ "$try" -eq "$PREFERRED_OFFSET" ] && [ -n "$FOUND" ] && continue
-      if ! port_in_use $(( 54321 + try )) && ! port_in_use $(( 54322 + try )); then
-        FOUND=$try; break
-      fi
-    done
-    if [ -z "$FOUND" ]; then
-      warn "no free Supabase port range found (100-2000); skipping isolation"
-    else
-      OFFSET=$FOUND
-    fi
-  fi
+  # All 8 host ports move together as one block per offset. Offsets are 100
+  # apart and the 5432x cluster is <10 wide, so two DIFFERENT offsets never
+  # overlap — only a DUPLICATE offset collides. Selection = a unique offset.
+  SB_BASE_PORTS=(54320 54321 54322 54323 54324 54327 54329 8083)
+
+  # Reserve every OTHER worktree's offset, read straight from its config.toml —
+  # no sidecar file, the configs are the source of truth. This catches sibling
+  # stacks whether running OR stopped, which a live probe alone misses (a stopped
+  # sibling holds no ports but will collide once both start). A clean checkout
+  # with no [api] override uses default ports => offset 0.
+  RESERVED_OFFSETS=" "
+  while IFS= read -r wt; do
+    [ "$wt" = "$WORKTREE_PATH" ] && continue
+    cfg="$wt/supabase/config.toml"
+    [ -f "$cfg" ] || continue
+    api=$(awk '/^\[api\]/{f=1;next} /^\[/{f=0} f&&$1=="port"{print $3;exit}' "$cfg")
+    case "$api" in ''|*[!0-9]*) o=0 ;; *) o=$((api-54321)) ;; esac
+    RESERVED_OFFSETS="${RESERVED_OFFSETS}${o} "
+  done < <(git -C "$WT_ROOT" worktree list --porcelain | awk '/^worktree /{print $2}')
+
+  # offset_free <try>: 0 if not reserved by a sibling AND none of its 8 ports
+  # are currently bound. The live probe catches running siblings, orphaned stacks
+  # left behind by removed worktrees, and unrelated processes.
+  offset_free() {
+    local try=$1 base r
+    for r in $RESERVED_OFFSETS; do [ "$r" = "$try" ] && return 1; done
+    for base in "${SB_BASE_PORTS[@]}"; do port_in_use $((base+try)) && return 1; done
+    return 0
+  }
+
+  OFFSET=""
+  for try in "$PREFERRED_OFFSET" $(seq 100 100 2000); do
+    offset_free "$try" && { OFFSET=$try; break; }
+  done
+  [ -z "$OFFSET" ] && warn "no free Supabase offset found (all 20 reserved/bound); skipping isolation"
 
   if [ -n "$OFFSET" ]; then
     # Hide config.toml changes from git in this worktree only (skip-worktree
@@ -286,28 +325,55 @@ if [ -f "$SB_CONFIG" ]; then
     # 1. Replace project_id.
     sed -i "s/^project_id = .*/project_id = \"$SB_PROJECT_ID\"/" "$SB_CONFIG"
 
-    # 2. Append port overrides for all services.
-    cat >> "$SB_CONFIG" <<EOF
+    # 2. Inject port overrides, MERGING into any table the repo's config.toml
+    # already declares. A blind append breaks repos whose config ships an active
+    # version of one of these tables (cora has [edge_runtime] with enabled/policy):
+    # the duplicate top-level table then fails `supabase start` with
+    # "toml: table edge_runtime already exists". For each override we set the key
+    # inside the existing table (scoped by awk so a shared key like `port` only
+    # touches its own table) when present, else append the table fresh at the end.
+    overrides=(
+      "api|port|$(( 54321 + OFFSET ))"
+      "db|port|$(( 54322 + OFFSET ))"
+      "db|shadow_port|$(( 54320 + OFFSET ))"
+      "db.pooler|port|$(( 54329 + OFFSET ))"
+      "studio|port|$(( 54323 + OFFSET ))"
+      "inbucket|port|$(( 54324 + OFFSET ))"
+      "analytics|port|$(( 54327 + OFFSET ))"
+      "edge_runtime|inspector_port|$(( 8083 + OFFSET ))"
+    )
+    new_block="" seen_tables=""
+    for ov in "${overrides[@]}"; do
+      IFS='|' read -r tbl key val <<< "$ov"
+      if grep -q "^\[${tbl}\]\$" "$SB_CONFIG"; then
+        # Table exists: rewrite just that block — drop any prior <key> line and
+        # inject <key> = <val> under the header. intbl scopes the drop to this
+        # table (up to the next [...] header), so it never touches sibling tables.
+        awk -v t="$tbl" -v k="$key" -v v="$val" '
+          $0 == "[" t "]" { print; print k " = " v; intbl = 1; next }
+          /^\[/           { intbl = 0 }
+          intbl && $0 ~ ("^" k " = ") { next }
+          { print }
+        ' "$SB_CONFIG" > "$SB_CONFIG.tmp" && mv "$SB_CONFIG.tmp" "$SB_CONFIG"
+      else
+        # Table absent: stage for the appended block (emit each header once).
+        case "$seen_tables" in *"|${tbl}|"*) ;; *)
+          seen_tables="${seen_tables}|${tbl}|"
+          new_block="${new_block}[${tbl}]"$'\n' ;;
+        esac
+        new_block="${new_block}${key} = ${val}"$'\n'
+      fi
+    done
+    if [ -n "$new_block" ]; then
+      new_block="${new_block%$'\n'}"   # trim trailing newline; heredoc re-adds one
+      cat >> "$SB_CONFIG" <<EOF
 
 # --- WORKTREE-LOCAL OVERRIDES (hidden via git skip-worktree) ---
 # Generated by new-worktree for isolated local Supabase. Do not commit;
 # git update-index --no-skip-worktree supabase/config.toml to reveal.
-[api]
-port = $(( 54321 + OFFSET ))
-[db]
-port = $(( 54322 + OFFSET ))
-shadow_port = $(( 54320 + OFFSET ))
-[db.pooler]
-port = $(( 54329 + OFFSET ))
-[studio]
-port = $(( 54323 + OFFSET ))
-[inbucket]
-port = $(( 54324 + OFFSET ))
-[analytics]
-port = $(( 54327 + OFFSET ))
-[edge_runtime]
-inspector_port = $(( 8083 + OFFSET ))
+$new_block
 EOF
+    fi
     if [ "$PREFERRED_OFFSET" -ne "$OFFSET" ]; then
       ok "Supabase isolated: project_id=$SB_PROJECT_ID, ports +$OFFSET (preferred +$PREFERRED_OFFSET was busy)"
     else
@@ -315,6 +381,23 @@ EOF
     fi
   fi
 fi
+
+# --- Sticky per-worktree vite dev port (9000, 9010, 9020, … step 10) ---
+# Each linked worktree gets its own port so `bun run dev` / `dev:local` /
+# `dev:preview` don't fight over 8080 (vite.config.ts reads this file). The
+# 10-wide band reserves base/base+1/base+2 for the three dev modes. Main
+# checkout has no file and stays on 8080. Registry-based: highest existing
+# .vite-port + 10, min 9000 — mirrors the RESERVED_OFFSETS scan above.
+vite_max=8990
+while IFS= read -r wt; do
+  [ "$wt" = "$WORKTREE_PATH" ] && continue
+  [ -f "$wt/.vite-port" ] || continue
+  v="$(head -1 "$wt/.vite-port" 2>/dev/null | tr -d '[:space:]')"
+  [[ "$v" =~ ^[0-9]+$ ]] && (( v > vite_max )) && vite_max=$v
+done < <(git -C "$WT_ROOT" worktree list --porcelain | awk '/^worktree /{print $2}')
+VITE_PORT=$((vite_max + 10))
+printf '%s\n' "$VITE_PORT" >"$WORKTREE_PATH/.vite-port"
+ok "vite dev port: $VITE_PORT (dev/dev:local/dev:preview = $VITE_PORT/$((VITE_PORT + 1))/$((VITE_PORT + 2)))"
 
 # --- mcporter MCP baseline (worktrees access MCPs via mcporter, not Cursor) ---
 # Cursor does not load .cursor/mcp.json from worktree dirs registered via
