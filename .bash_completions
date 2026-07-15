@@ -74,3 +74,61 @@ _wt_completion() {
     fi
 }
 complete -F _wt_completion wt
+
+# ----------------------------------------------------------------------------
+# mcporter — MCP CLI & generator (bun global). Completes subcommands,
+# `config` subcommands, and server names. Server names are parsed offline from
+# the MCP config JSONs (~instant); `mcporter list` pings every server (~2.6s),
+# so it is deliberately NOT called on TAB.
+# ----------------------------------------------------------------------------
+_mcporter_servers() {
+    local f
+    for f in "$HOME/.claude.json" "$HOME/.config/mcporter/mcporter.json"; do
+        [ -r "$f" ] || continue
+        node -e '
+            var c; try { c = require(process.argv[1]); } catch (e) { process.exit(0); }
+            function dump(o){ if (o) Object.keys(o).forEach(function(k){ console.log(k); }); }
+            dump(c.mcpServers);
+            if (c.projects) Object.keys(c.projects).forEach(function(p){ dump(c.projects[p].mcpServers); });
+        ' "$f" 2>/dev/null
+    done | sort -u
+}
+
+_mcporter() {
+    local cur sub
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    local subcmds="list call resource auth vault record replay generate-cli inspect-cli emit-ts config"
+    local cfg_subcmds="list get add remove import login logout doctor"
+
+    # First word: top-level subcommands.
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "$subcmds --help -h" -- "$cur") )
+        return 0
+    fi
+
+    sub="${COMP_WORDS[1]}"
+    case "$sub" in
+        config)
+            # `mcporter config <TAB>` → config subcommands.
+            if [ "$COMP_CWORD" -eq 2 ]; then
+                COMPREPLY=( $(compgen -W "$cfg_subcmds --help -h" -- "$cur") )
+                return 0
+            fi
+            # `mcporter config {get|remove|login|logout} <TAB>` → server names.
+            case "${COMP_WORDS[2]}" in
+                get|remove|login|logout)
+                    COMPREPLY=( $(compgen -W "$(_mcporter_servers)" -- "$cur") ); return 0 ;;
+                import)
+                    COMPREPLY=( $(compgen -W "claude-code cursor vscode" -- "$cur") ); return 0 ;;
+            esac
+            ;;
+        list)
+            COMPREPLY=( $(compgen -W "$(_mcporter_servers)" -- "$cur") ); return 0 ;;
+        call)
+            # Selector is `server.tool` — complete the server half (before any dot).
+            COMPREPLY=( $(compgen -W "$(_mcporter_servers)" -- "${cur%%.*}") ); return 0 ;;
+        resource|auth|vault)
+            COMPREPLY=( $(compgen -W "$(_mcporter_servers)" -- "$cur") ); return 0 ;;
+    esac
+}
+complete -F _mcporter mcporter
