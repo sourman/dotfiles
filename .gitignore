@@ -58,3 +58,10 @@
 .bash_logout
 .ICEauthority
 .Xauthority
+
+/.crew/
+/.crew
+!.crew/artifacts/
+!.crew/graphs/
+!.crew/artifacts/.gitkeep
+!.crew/graphs/.gitkeep
