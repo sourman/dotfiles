@@ -196,25 +196,28 @@ _wt_orphan_ids() {
   comm -13 <(printf '%s\n' "$live") <(_wt_docker_pids) | grep -v '^$'
 }
 
-# vite column for a worktree path
+# vite/dev-server column for a worktree path. The leading glyph is the only
+# running signal: ● = a vite dev server for this worktree is bound right now,
+# ○ = idle. Followed by the configured base port; * marks the legacy 8080 band
+# (no sticky .vite-port). strictPort means only the 8080 owner can ever show ●.
+# dev/dev:local/dev:preview are base/base+1/base+2 (see the wt ls legend).
 _wt_render_vite() {
-  local path="$1" vp star="*" out="" p
+  local path="$1" vp p bound=0
   vp="$(_wt_vite_port_for_path "$path")"
   if [ -z "$vp" ]; then
-    # no sticky port: main checkout (.git dir) is legit 8080; pre-existing linked
-    # worktrees get 8080* (collision-prone legacy band). ▲ lands only on the row
-    # that actually holds 8080, so "who grabbed 8080?" is a column scan.
-    [ -d "$path/.git" ] && star=""
+    # no sticky port: main checkout (.git dir) legitimately owns 8080; any other
+    # linked worktree sharing 8080 gets * (strictPort: only one can bind it).
+    local star="*"; [ -d "$path/.git" ] && star=""
     if _wt_is_listening 8080 && [ "$_WT_8080_OWNER" = "$path" ]; then
-      out="8080${star}▲"
+      printf '●8080'
     else
-      out="8080${star}"
+      printf '○8080%s' "$star"
     fi
   else
-    for p in $((vp)) $((vp + 1)) $((vp + 2)); do _wt_is_listening "$p" && out+=" ${p}▲"; done
-    [ -z "$out" ] && out="$vp"
+    # sticky 9xxx: report the lowest currently-bound port (●), else idle base (○).
+    for p in $((vp)) $((vp + 1)) $((vp + 2)); do _wt_is_listening "$p" && bound=$p; done
+    [ "$bound" -gt 0 ] && printf '●%s' "$bound" || printf '○%s' "$vp"
   fi
-  printf '%s' "$out"
 }
 
 # supabase column for a worktree path (studio url when up, else ·)
@@ -243,10 +246,10 @@ _wt_fzf_header() {
   local orphan_n edge_n
   orphan_n="$(_wt_orphan_ids | grep -c .)"
   edge_n="$(printf '%s' "$_WT_SERVE" | grep -c .)"
-  local h='NAME  BRANCH   VITE   supabase'
+  local h='NAME  BRANCH   DEV    supabase'
   (( orphan_n > 0 )) && h+="   ⚠ ${orphan_n} orphan(s): wt reap"
   (( edge_n > 0 )) && h+="   ⚡ ${edge_n} edge serve"
-  h+='   | dev=base  dev:local=+1  dev:preview=+2  ▲=bound'
+  h+='   | ● running  ○ idle  *=no sticky port (8080 band)'
   printf '%s' "$h"
 }
 
@@ -299,6 +302,9 @@ wt() {
   local arg="${1:-}"
   [ -z "$arg" ] && arg="go"
 
+  _WT_STATE_LOADED=0   # fresh probe snapshot per wt invocation (the cache
+                       # would otherwise persist for the shell lifetime and
+                       # hide a dev server started since the last wt call)
   case "$arg" in
     go)
       local fzf_query="$2" target
@@ -323,11 +329,16 @@ wt() {
       ;;
     ls|list)
       _wt_state_init
-      printf '%-28s %-26s %-16s %s\n' WORKTREE BRANCH VITE supabase
-      _wt_rich_entries \
-        | awk -F'\t' '{printf "%-28s %-26s %-16s %s\n", $1, $2, $4, $5}'
+      # Dynamic-width table: column(1) sizes each column to its widest cell
+      # (header included), so long worktree/branch names never misalign the
+      # DEV/supabase columns. Branch collapses to "-" when it merely repeats
+      # the worktree name. DEV column leads with a glyph (● bound / ○ idle)
+      # before the configured base port; *=no sticky .vite-port (8080 band).
+      { printf 'WORKTREE\tBRANCH\tDEV\tsupabase\n'
+        _wt_rich_entries | awk -F'\t' '{print $1"\t"($2==$1?"-":$2)"\t"$4"\t"$5}'
+      } | column -t -s$'\t' -o '  '
       echo
-      echo '  dev=base · dev:local=base+1 · dev:preview=base+2 · ▲=bound · 8080*=no sticky port (pre-existing)'
+      echo '  dev=base · dev:local=base+1 · dev:preview=base+2 · ● running  ○ idle  ·  *=no sticky port (8080 band)'
       _wt_orphan_report
       _wt_edge_report
       ;;
