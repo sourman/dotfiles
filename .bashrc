@@ -192,6 +192,23 @@ elif [ -f /usr/share/doc/fzf/examples/key-bindings.bash ]; then
   . /usr/share/doc/fzf/examples/completion.bash
 fi
 
+# ----------------------------------------------------------------------------
+# Restore native bash-completion for commands fzf overwrote.
+# fzf's completion setup (both its completion.bash AND ble.sh's fzf-completion
+# integration) unconditionally stamps `_fzf_path_completion` onto every command
+# in its "Anything" list — git, curl, scp, sftp, java, perl, python, tar, … —
+# which CLOBBERS their real completions. Symptom: `git check<TAB>` completed
+# file paths instead of `checkout`. This re-loads the native completion for any
+# victim that actually has one; commands without a native script keep fzf's
+# path fallback (correct). Must run AFTER fzf and BEFORE ble-attach so the right
+# registration is in place when ble attaches.
+# ----------------------------------------------------------------------------
+if declare -F _completion_loader >/dev/null 2>&1; then
+  while read -r _cmd; do
+    [ -n "$_cmd" ] && _completion_loader "$_cmd" 2>/dev/null
+  done < <(complete -p 2>/dev/null | awk '/_fzf_path_completion/{print $NF}' | sort -u)
+fi
+
 # Starship prompt (git-aware, nerd-font powerline) — overrides PS1 above
 eval "$(starship init bash)"
 
@@ -199,3 +216,4 @@ eval "$(starship init bash)"
 if [[ ${BLE_VERSION-} ]]; then
   ble-attach
 fi
+export PATH="$HOME/.deno/bin:$PATH"
