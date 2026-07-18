@@ -66,15 +66,36 @@ _wt_fzf_path() {
   if [[ ${BLE_VERSION-} ]] && declare -F ble/decode/detach >/dev/null 2>&1; then
     had_ble=1; ble/decode/detach
   fi
-  _wt_rich_entries \
+  # Aligned picker rows: line 1 = column header; each data line is
+  # "<padded name>  <branch>  <dev>  <supabase>\t<path>" so fzf shows the
+  # display (--with-nth=1) and we recover the path (field 2) afterwards.
+  local -a rows
+  local table
+  # Build via a pipe into $(...) rather than a nested <(...) process
+  # substitution, which can race the SERVE-loop probe inside _wt_state_init.
+  table=$(_wt_rich_entries | awk -F'\t' '
+    function max(a,b){return a>b?a:b}
+    { nm[NR]=$1; br[NR]=($2==$1?"-":$2); pt[NR]=$3; dv[NR]=$4; sb[NR]=$5
+      w1=max(w1,length(nm[NR])); w2=max(w2,length(br[NR])); w3=max(w3,length(dv[NR])) }
+    END { h1="WORKTREE"; h2="BRANCH"; h3="DEV"
+      w1=max(w1,length(h1)); w2=max(w2,length(h2)); w3=max(w3,length(h3))
+      printf "%-*s  %-*s  %-*s  %s\n", w1,h1, w2,h2, w3,h3, "supabase"
+      for (i=1;i<=NR;i++) printf "%-*s  %-*s  %-*s  %s\t%s\n", w1,nm[i], w2,br[i], w3,dv[i], sb[i], pt[i] }')
+  mapfile -t rows <<< "$table"
+  local header="${rows[0]}" legend
+  legend="$(_wt_fzf_header)"
+  [ -n "$legend" ] && header="$header"$'\n'"$legend"
+  local sel
+  sel=$(printf '%s\n' "${rows[@]:1}" \
     | fzf --query="$query" --prompt='worktree> ' \
-          --delimiter='\t' --with-nth=1,2,4,5 --header="$(_wt_fzf_header)" \
+          --delimiter='\t' --with-nth=1 --header="$header" \
           --height=40% --min-height=20 --reverse \
-    | awk -F'\t' '{print $3}'
+    | awk -F'\t' '{print $2}')
   local rc=$?
   if (( had_ble )) && declare -F ble/decode/attach >/dev/null 2>&1; then
     ble/decode/attach
   fi
+  printf '%s\n' "$sel"
   return $rc
 }
 
@@ -197,12 +218,13 @@ _wt_orphan_ids() {
 }
 
 # vite/dev-server column for a worktree path. The leading glyph is the only
-# running signal: ● = a vite dev server for this worktree is bound right now,
-# ○ = idle. Followed by the configured base port; * marks the legacy 8080 band
-# (no sticky .vite-port). strictPort means only the 8080 owner can ever show ●.
-# dev/dev:local/dev:preview are base/base+1/base+2 (see the wt ls legend).
+# running signal: bullet = one or more vite dev servers for this worktree are
+# bound now, ring = idle. Sticky 9xxx worktrees list every bound port in the
+# base/+1/+2 band (dev/dev:local/dev:preview), comma-joined; idle shows the base.
+# * = legacy 8080 band (no sticky .vite-port); strictPort means only the 8080
+# owner can ever show the running glyph.
 _wt_render_vite() {
-  local path="$1" vp p bound=0
+  local path="$1" vp p bound=""
   vp="$(_wt_vite_port_for_path "$path")"
   if [ -z "$vp" ]; then
     # no sticky port: main checkout (.git dir) legitimately owns 8080; any other
@@ -214,9 +236,9 @@ _wt_render_vite() {
       printf '○8080%s' "$star"
     fi
   else
-    # sticky 9xxx: report the lowest currently-bound port (●), else idle base (○).
-    for p in $((vp)) $((vp + 1)) $((vp + 2)); do _wt_is_listening "$p" && bound=$p; done
-    [ "$bound" -gt 0 ] && printf '●%s' "$bound" || printf '○%s' "$vp"
+    # sticky 9xxx: collect every bound port across base/+1/+2, comma-joined.
+    for p in $((vp)) $((vp + 1)) $((vp + 2)); do _wt_is_listening "$p" && bound="${bound:+$bound,}$p"; done
+    [ -n "$bound" ] && printf '●%s' "$bound" || printf '○%s' "$vp"
   fi
 }
 
@@ -246,10 +268,10 @@ _wt_fzf_header() {
   local orphan_n edge_n
   orphan_n="$(_wt_orphan_ids | grep -c .)"
   edge_n="$(printf '%s' "$_WT_SERVE" | grep -c .)"
-  local h='NAME  BRANCH   DEV    supabase'
-  (( orphan_n > 0 )) && h+="   ⚠ ${orphan_n} orphan(s): wt reap"
-  (( edge_n > 0 )) && h+="   ⚡ ${edge_n} edge serve"
-  h+='   | ● running  ○ idle  *=no sticky port (8080 band)'
+  local h=''
+  (( orphan_n > 0 )) && h+="⚠ ${orphan_n} orphan(s): wt reap  "
+  (( edge_n > 0 )) && h+="⚡ ${edge_n} edge serve  "
+  h+='● running  ○ idle  *=no sticky port (8080 band)'
   printf '%s' "$h"
 }
 
