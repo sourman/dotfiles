@@ -320,6 +320,92 @@ _wt_edge_report() {
   done <<<"$_WT_SERVE"
 }
 
+# ============================================================================
+# wt — local dev DNS via Caddy. Visit <worktree>.<app>.test (plus -local /
+# -preview variants) instead of localhost:<port>. `wt proxy` rewrites a managed
+# /etc/hosts block (glibc checks `files` before Tailscale DNS, so this wins with
+# zero resolver conflict) plus /etc/caddy/wt-routes.caddy, then reloads caddy.
+# Subdomains key off the worktree NAME (not branch), so they survive a checkout.
+# ============================================================================
+
+# slugify a worktree name into one DNS label (lowercase [a-z0-9-])
+_wt_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+# per-app DNS zone, e.g. "cora.test": basename of the repo's main checkout,
+# resolved from the shared git-common-dir (the main worktree's .git).
+_wt_app_name() {
+  local cd
+  cd="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  cd="$(cd "$cd" && pwd -P)"; cd="${cd%/.git}"
+  basename "$cd"
+}
+
+# Emit "<subdomain>\t<port>" for every routeable worktree dev mode
+# (dev / -local=+1 / -preview=+2). Main checkout uses 8080; linked worktrees use
+# their .vite-port; legacy linked worktrees without one are skipped (wt adopt).
+_wt_routes() {
+  local app zone name branch path port sub m p
+  app="$(_wt_app_name)" || return 1
+  zone="${app}.test"
+  _wt_entries | while IFS=$'\t' read -r name branch path; do
+    [ -n "$path" ] || continue
+    if [ -d "$path/.git" ]; then port=8080
+    else port="$(_wt_vite_port_for_path "$path")"; fi
+    if [ -z "$port" ]; then
+      printf 'wt proxy: skip %s (no .vite-port -- run: wt adopt %s)\n' "$name" "$name" >&2
+      continue
+    fi
+    sub="$(_wt_slug "$name")"   # <slug>.<app>.test (main is cora.cora.test by design)
+    for m in '' '-local' '-preview'; do
+      p=$port
+      [ "$m" = '-local' ] && p=$((port + 1))
+      [ "$m" = '-preview' ] && p=$((port + 2))
+      printf '%s%s.%s\t%s\n' "$sub" "$m" "$zone" "$p"
+    done
+  done
+}
+
+# Regenerate /etc/hosts (managed block) + /etc/caddy/wt-routes.caddy, reload caddy.
+_wt_proxy_apply() {
+  local routes hosts caddy tmp
+  routes="$(_wt_routes)"
+  hosts="$(printf '%s' "$routes" | awk -F'\t' '{print "127.0.0.1 "$1}' | sort -u)"
+  caddy="$(printf '%s' "$routes" | awk -F'\t' '{printf "%s {\n\ttls internal\n\treverse_proxy 127.0.0.1:%s\n}\n", $1, $2}')"
+  # rewrite the managed /etc/hosts block, preserving everything outside it
+  tmp="$(mktemp)"
+  awk '/^# BEGIN wt-proxy/{f=1} !f{print} /^# END wt-proxy/{f=0}' /etc/hosts > "$tmp"
+  { echo "# BEGIN wt-proxy (managed by wt proxy)"; printf '%s\n' "$hosts"; echo "# END wt-proxy"; } >> "$tmp"
+  sudo cp "$tmp" /etc/hosts && rm -f "$tmp"
+  printf '%s' "$caddy" | sudo tee /etc/caddy/wt-routes.caddy >/dev/null
+  sudo systemctl reload caddy
+  echo "Routes:"
+  printf '%s' "$routes" | awk -F'\t' '{printf "  https://%s -> %s\n", $1, $2}'
+}
+
+# Assign a sticky 9xxx .vite-port to legacy linked worktrees (all, or one name),
+# mirroring new-worktree's allocation (max existing + 10, min 9000).
+_wt_adopt() {
+  local query="${1:-}" name branch path v out vmax
+  # highest existing sticky port (assign max+10, min 9000), mirroring new-worktree
+  vmax=$(_wt_entries | while IFS=$'\t' read -r name branch path; do
+    [ -f "$path/.vite-port" ] || continue
+    v="$(head -1 "$path/.vite-port" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$v" =~ ^[0-9]+$ ]] && echo "$v"
+  done | sort -n | tail -1)
+  vmax="${vmax:-8990}"
+  out=$(_wt_entries | while IFS=$'\t' read -r name branch path; do
+    [ -n "$path" ] || continue
+    { [ -d "$path/.git" ] || [ -f "$path/.vite-port" ]; } && continue
+    [ -n "$query" ] && [ "$query" != "$name" ] && continue
+    vmax=$((vmax + 10))
+    printf '%s' "$vmax" > "$path/.vite-port"
+    echo "  adopted $name -> .vite-port=$vmax (dev/local/preview = $vmax/$((vmax+1))/$((vmax+2)))"
+  done)
+  if [ -n "$out" ]; then printf '%s\n' "$out"; else echo "  nothing to adopt (all linked worktrees already have a sticky .vite-port)."; fi
+}
+
 wt() {
   local arg="${1:-}"
   [ -z "$arg" ] && arg="go"
@@ -534,6 +620,15 @@ wt() {
       done <<<"$targets"
       if (( dry )); then echo "(dry-run — nothing removed; re-run without --dry-run)"; fi
       ;;
+    proxy)
+      git rev-parse --git-dir >/dev/null 2>&1 || { echo 'wt proxy: run from within a git repo.' >&2; return 1; }
+      command -v caddy >/dev/null 2>&1 || { echo 'wt proxy: caddy is not installed.' >&2; return 1; }
+      _wt_proxy_apply
+      ;;
+    adopt)
+      git rev-parse --git-dir >/dev/null 2>&1 || { echo 'wt adopt: run from within a git repo.' >&2; return 1; }
+      _wt_adopt "$2"
+      ;;
     help|-h|--help)
       cat <<'HELP'
 wt — worktree navigator (jump is the default)
@@ -553,6 +648,10 @@ wt — worktree navigator (jump is the default)
   wt reap --all     reap every orphan without prompting
   wt reap --dry-run preview what reaping would remove
   wt prune          prune stale worktree refs
+  wt proxy         (re)generate local dev DNS: <worktree>.cora.test -> vite port
+                    via Caddy (tls internal). Re-run after wt new / rm / adopt.
+  wt adopt [name]  assign a sticky .vite-port (9xxx) to a legacy worktree so it
+                    gets its own dev URL too (all, or one worktree name)
 
 Jump mode is the default — any unrecognized arg is treated as a substring to
 match against worktree names. So `wt feat` == `wt go feat`. Vite dev ports are
