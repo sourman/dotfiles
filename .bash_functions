@@ -75,12 +75,12 @@ _wt_fzf_path() {
   # substitution, which can race the SERVE-loop probe inside _wt_state_init.
   table=$(_wt_rich_entries | awk -F'\t' '
     function max(a,b){return a>b?a:b}
-    { nm[NR]=$1; br[NR]=($2==$1?"-":$2); pt[NR]=$3; dv[NR]=$4; sb[NR]=$5
-      w1=max(w1,length(nm[NR])); w2=max(w2,length(br[NR])); w3=max(w3,length(dv[NR])) }
-    END { h1="WORKTREE"; h2="BRANCH"; h3="DEV"
-      w1=max(w1,length(h1)); w2=max(w2,length(h2)); w3=max(w3,length(h3))
-      printf "%-*s  %-*s  %-*s  %s\n", w1,h1, w2,h2, w3,h3, "supabase"
-      for (i=1;i<=NR;i++) printf "%-*s  %-*s  %-*s  %s\t%s\n", w1,nm[i], w2,br[i], w3,dv[i], sb[i], pt[i] }')
+    { nm[NR]=$1; br[NR]=($2==$1?"-":$2); pt[NR]=$3; dv[NR]=$4; sb[NR]=$5; ul[NR]=($6==""?"-":$6)
+      w1=max(w1,length(nm[NR])); w2=max(w2,length(br[NR])); w3=max(w3,length(dv[NR])); w4=max(w4,length(ul[NR])) }
+    END { h1="WORKTREE"; h2="BRANCH"; h3="DEV"; h4="URL"
+      w1=max(w1,length(h1)); w2=max(w2,length(h2)); w3=max(w3,length(h3)); w4=max(w4,length(h4))
+      printf "%-*s  %-*s  %-*s  %-*s  %s\n", w1,h1, w2,h2, w3,h3, w4,h4, "supabase"
+      for (i=1;i<=NR;i++) printf "%-*s  %-*s  %-*s  %-*s  %s\t%s\n", w1,nm[i], w2,br[i], w3,dv[i], w4,ul[i], sb[i], pt[i] }')
   mapfile -t rows <<< "$table"
   local header="${rows[0]}" legend
   legend="$(_wt_fzf_header)"
@@ -249,16 +249,28 @@ _wt_render_supabase() {
   sp="$(_wt_studio_port "$pid")"
   [ -n "$sp" ] && printf 'http://localhost:%s' "$sp" || printf '·'
 }
+# proxy dev URL host for a worktree (feat-x.cora.test); empty for a legacy
+# worktree with no routeable port (no .vite-port -> wt adopt).
+_wt_url_for() {
+  local path="$1" app="${2:-}" port name
+  if [ -d "$path/.git" ]; then port=8080
+  else port="$(_wt_vite_port_for_path "$path")"; fi
+  [ -n "$port" ] && [ -n "$app" ] || return 0
+  name="$(basename "$path")"
+  printf '%s.%s.test' "$(_wt_slug "$name")" "$app"
+}
 
 # name<TAB>branch<TAB>path<TAB>vite<TAB>supabase  (lookups computed once)
 _wt_rich_entries() {
   _wt_state_init
-  local name branch path vite sb
+  local name branch path vite sb url app
+  app="$(_wt_app_name)"
   while IFS=$'\t' read -r name branch path; do
     [ -n "$path" ] || continue
     vite="$(_wt_render_vite "$path")"
     sb="$(_wt_render_supabase "$path")"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$branch" "$path" "$vite" "$sb"
+    url="$(_wt_url_for "$path" "$app")"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$branch" "$path" "$vite" "$sb" "$url"
   done < <(_wt_entries)
 }
 
@@ -271,7 +283,7 @@ _wt_fzf_header() {
   local h=''
   (( orphan_n > 0 )) && h+="⚠ ${orphan_n} orphan(s): wt reap  "
   (( edge_n > 0 )) && h+="⚡ ${edge_n} edge serve  "
-  h+='● running  ○ idle  *=no sticky port (8080 band)'
+  h+='● running  ○ idle  *=no sticky port (8080 band)  - =no URL (wt adopt)'
   printf '%s' "$h"
 }
 
@@ -442,11 +454,11 @@ wt() {
       # DEV/supabase columns. Branch collapses to "-" when it merely repeats
       # the worktree name. DEV column leads with a glyph (● bound / ○ idle)
       # before the configured base port; *=no sticky .vite-port (8080 band).
-      { printf 'WORKTREE\tBRANCH\tDEV\tsupabase\n'
-        _wt_rich_entries | awk -F'\t' '{print $1"\t"($2==$1?"-":$2)"\t"$4"\t"$5}'
+      { printf 'WORKTREE\tBRANCH\tDEV\tURL\tsupabase\n'
+        _wt_rich_entries | awk -F'\t' '{print $1"\t"($2==$1?"-":$2)"\t"$4"\t"($6==""?"-":$6)"\t"$5}'
       } | column -t -s$'\t' -o '  '
       echo
-      echo '  dev=base · dev:local=base+1 · dev:preview=base+2 · ● running  ○ idle  ·  *=no sticky port (8080 band)'
+      echo '  dev=base · dev:local=base+1 · dev:preview=base+2 · ● running  ○ idle  ·  *=no sticky port (8080 band)  ·  - =no URL (wt adopt)'
       _wt_orphan_report
       _wt_edge_report
       ;;
