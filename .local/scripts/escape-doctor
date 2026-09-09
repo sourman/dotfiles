@@ -1,0 +1,101 @@
+#!/bin/bash
+# Trace physical Escape through evdev + X11. Run while Escape is broken.
+set -euo pipefail
+DISPLAY="${DISPLAY:-:0}"
+export DISPLAY
+
+secs="${1:-12}"
+echo "escape-doctor: press Escape on your keyboard for ${secs}s..."
+echo "Watching evdev (KEY_ESC=1) + X11 keycode 9. Ctrl+C to stop early."
+echo
+
+python3 - "$secs" <<'PY'
+import os, select, struct, subprocess, sys, time
+from Xlib import X, display
+from Xlib.ext import record
+
+secs = int(sys.argv[1])
+EVENT_SIZE = struct.calcsize('llHHi')
+EV_KEY = 1
+KEY_ESC = 1
+
+devs = []
+for root, _, files in os.walk('/dev/input'):
+    for f in files:
+        if f.startswith('event'):
+            p = os.path.join(root, f)
+            try:
+                if os.stat(p).st_mode & 0o060:
+                    devs.append(p)
+            except OSError:
+                pass
+devs = sorted(set(devs))
+
+fds = {}
+for p in devs:
+    try:
+        fds[os.open(p, os.O_RDONLY | os.O_NONBLOCK)] = p
+    except OSError:
+        pass
+
+d = display.Display()
+ctx = d.record_create_context(0, [record.AllClients], [{
+    'core_requests': (0, 0), 'core_replies': (0, 0),
+    'ext_requests': (0, 0, 0, 0), 'ext_replies': (0, 0, 0, 0),
+    'delivered_events': (X.KeyPress, X.KeyRelease),
+    'device_events': (X.KeyPress, X.KeyRelease),
+    'errors': (0, 0), 'client_started': False, 'client_died': False,
+}])
+x_events = []
+def x_cb(reply):
+    if reply.category != record.FromServer:
+        return
+    data = bytes(reply.data)
+    for off in range(0, len(data) - 31, 32):
+        et = data[off]
+        if et in (X.KeyPress, X.KeyRelease):
+            x_events.append((time.time(), 'X', et, data[off + 1]))
+
+import threading
+def run_rec():
+    d.record_enable_context(ctx, x_cb)
+threading.Thread(target=run_rec, daemon=True).start()
+
+t0 = time.time()
+evdev_esc = []
+while time.time() - t0 < secs:
+    r, _, _ = select.select(list(fds.keys()), [], [], 0.1)
+    for fd in r:
+        data = os.read(fd, EVENT_SIZE * 32)
+        for i in range(0, len(data), EVENT_SIZE):
+            if i + EVENT_SIZE > len(data):
+                break
+            _, _, typ, code, val = struct.unpack('llHHi', data[i:i + EVENT_SIZE])
+            if typ == EV_KEY and code == KEY_ESC:
+                evdev_esc.append((time.time(), fds[fd], val))
+
+d.record_disable_context(ctx)
+x_esc = [e for e in x_events if e[3] == 9]
+
+print(f"evdev KEY_ESC events: {len(evdev_esc)}")
+for e in evdev_esc[:8]:
+    print(f"  {e[1]} value={e[2]}")
+print(f"X11 keycode-9 events: {len(x_esc)}")
+for e in x_esc[:8]:
+    print(f"  type={e[2]} keycode={e[3]}")
+
+if evdev_esc and not x_esc:
+    print("\nDIAGNOSIS: keyboard sends Escape but X11 never sees it -> ibus/xcape/xmodmap layer")
+elif not evdev_esc and not x_esc:
+    print("\nDIAGNOSIS: no Escape seen at all -> hardware/USB or wrong keyboard focused")
+elif evdev_esc and x_esc:
+    print("\nDIAGNOSIS: Escape reaches X11 -> app/WM is consuming it (xfwm4 cancel_key, shortcut, grab)")
+else:
+    print("\nDIAGNOSIS: ambiguous (X without evdev may be synthetic/xdotool)")
+PY
+
+echo
+echo "Software state:"
+pgrep -a xcape || echo "  xcape: not running"
+ibus engine 2>/dev/null | sed 's/^/  ibus engine: /' || true
+xmodmap -pke 2>/dev/null | awk '/keycode\s+9/' | sed 's/^/  /'

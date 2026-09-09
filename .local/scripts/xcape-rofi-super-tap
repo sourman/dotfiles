@@ -1,0 +1,4 @@
+#!/bin/bash
+# Super-tap -> rofi. Wrapper so XFCE autostart can't mangle xcape -e quoting.
+# Intentionally does NOT synthesize Escape (xcape eats real Escape when it's in the chord).
+exec xcape -e 'Super_L=Control_L|Shift_L|Super_L|F1'
