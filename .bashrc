@@ -163,9 +163,17 @@ if [ -d "/snap/bin" ] ; then
     PATH="/snap/bin:$PATH"
 fi
 
-# Android SDK
-export ANDROID_HOME=$HOME/Android/sdk
-PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/build-tools/34.0.0"
+# Android SDK (system install at /opt/android-sdk from gsm2computer setup.sh)
+if [ -d /opt/android-sdk ]; then
+    export ANDROID_HOME=/opt/android-sdk
+    export ANDROID_SDK_ROOT=/opt/android-sdk
+    PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+    _android_build_tools=$(ls -1d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)
+    if [ -n "$_android_build_tools" ]; then
+        PATH="${_android_build_tools%/}:$PATH"
+    fi
+    unset _android_build_tools
+fi
 
 # Go packages
 if [ -d "$HOME/go/bin" ] ; then
