@@ -44,7 +44,7 @@ resolve_ip() {
     echo "$REDMI_IP"
     return
   fi
-  tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print $1; exit }'
+  tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print $1; exit }' || true
 }
 
 pick_usb() {
@@ -168,8 +168,10 @@ if [[ -z "$adb_serial" ]]; then
     adb -s "$usb" tcpip "$ADB_PORT" >/dev/null
     sleep 2
     adb connect "${ip}:${ADB_PORT}" 2>/dev/null | tr -d '\r' || true
-    if pick_tailscale_adb "$ip" >/dev/null; then
+    if pick_tailscale_adb "$ip" >/dev/null \
+      && timeout 5 adb -s "${ip}:${ADB_PORT}" shell true >/dev/null 2>&1; then
       adb_serial="${ip}:${ADB_PORT}"
+      ok "Tailscale ADB on port $ADB_PORT"
     fi
   fi
 fi
