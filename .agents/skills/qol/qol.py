@@ -166,10 +166,6 @@ def _with_node_name(sink: Sink) -> Sink:
         is_default=sink.is_default,
         node_name=_sink_node_name(sink.wpctl_id),
     )
-    path = shutil.which(cmd)
-    if not path:
-        raise SystemExit(f"qol: missing dependency: {cmd}")
-    return path
 
 
 def list_sinks() -> list[Sink]:

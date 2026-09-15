@@ -11,6 +11,8 @@ description: >
 
 # qol
 
+CLI: `qol.py` in this folder. Needs an OpenAI API key (`qol key set`).
+
 ```bash
 qol "Blocked — need approval to deploy prod."
 qol -d jabra "Quick note in the headset."
