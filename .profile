@@ -26,4 +26,15 @@ if [ -d "$HOME/.local/bin" ] ; then
     PATH="$HOME/.local/bin:$PATH"
 fi
 
-. "$HOME/.local/bin/env"
+[ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
+. "$HOME/.cargo/env"
+
+# Second full-screen desktop on display :1 when you log in on tty8 (Ctrl+Alt+F8).
+# Only one VT is visible at a time; :1 starts here, not at boot alongside :0.
+case "$(tty 2>/dev/null)" in
+/dev/tty8)
+  if [ -z "${DISPLAY:-}" ] && [ -x /usr/bin/startx ]; then
+    exec startx "$HOME/.local/scripts/xsession-display1" -- :1 -keeptty vt8 -nolisten tcp
+  fi
+  ;;
+esac

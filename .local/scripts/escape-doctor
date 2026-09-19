@@ -96,6 +96,7 @@ PY
 
 echo
 echo "Software state:"
+pgrep -a Cap || echo "  Cap: not running"
 pgrep -a xcape || echo "  xcape: not running"
 ibus engine 2>/dev/null | sed 's/^/  ibus engine: /' || true
 xmodmap -pke 2>/dev/null | awk '/keycode\s+9/' | sed 's/^/  /'

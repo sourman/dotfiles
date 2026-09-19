@@ -1,0 +1,26 @@
+#!/bin/sh
+# Display :1 on tty8 (Ctrl+Alt+F8). Not started at boot — log in on F8 or use start here.
+set -e
+case "${1:-}" in
+  go)
+    echo "Switch to tty8 (Ctrl+Alt+F8), log in if prompted; XFCE on :1 starts from ~/.profile."
+    ;;
+  start)
+    tty_name=$(tty 2>/dev/null || true)
+    if [ "$tty_name" != "/dev/tty8" ]; then
+      echo "Run this on tty8 (Ctrl+Alt+F8), not $tty_name." >&2
+      exit 1
+    fi
+    if [ -n "${DISPLAY:-}" ]; then
+      echo "DISPLAY is already set ($DISPLAY)." >&2
+      exit 1
+    fi
+    exec startx "$HOME/.local/scripts/xsession-display1" -- :1 -keeptty vt8 -nolisten tcp
+    ;;
+  *)
+    echo "Usage: xdisplay1-ctl {go|start}" >&2
+    echo "  go    — reminder: use Ctrl+Alt+F8 and log in" >&2
+    echo "  start — start :1 from an existing tty8 shell (after Ctrl+Alt+C if X died)" >&2
+    exit 1
+    ;;
+esac

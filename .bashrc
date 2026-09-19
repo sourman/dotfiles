@@ -245,3 +245,4 @@ if [ -f '/home/ahmed/google-cloud-sdk/path.bash.inc' ]; then . '/home/ahmed/goog
 
 # Added by Cap
 export PATH="/home/ahmed/.cap/bin:$PATH"
+. "$HOME/.cargo/env"

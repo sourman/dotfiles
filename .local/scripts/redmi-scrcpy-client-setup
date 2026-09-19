@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Install ScrcpyForAndroid on the Redmi and remove the F-Droid wireless-debug client.
+#
+# Requires ADB over Tailscale (redmi:5555). Run `redmi` first if needed, or unlock
+# the phone and wait for adb-auto-enable.
+#
+# Usage: redmi-scrcpy-client-setup
+
+set -euo pipefail
+
+PHONE_HOST="${REDMI_HOST:-redmi}"
+ADB_PORT="${REDMI_ADB_PORT:-5555}"
+ADB_TIMEOUT="${REDMI_ADB_TIMEOUT:-8}"
+APK="${REDMI_SCRCPY_APK:-$HOME/.local/share/apk/ScrcpyForAndroid.apk}"
+OLD_PKG="invalid.lena.scrcpy"
+NEW_PKG="org.client.scrcpy"
+
+fail() { echo "redmi-scrcpy-client-setup: $*" >&2; exit 1; }
+note() { echo "redmi-scrcpy-client-setup: $*" >&2; }
+
+command -v adb >/dev/null 2>&1 || fail "adb not found"
+command -v tailscale >/dev/null 2>&1 || fail "tailscale not found"
+[[ -f "$APK" ]] || fail "APK not found at $APK (download from ScrcpyForAndroid releases)"
+
+if [[ -n "${REDMI_IP:-}" ]]; then
+  ip="$REDMI_IP"
+else
+  ip="$(tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print $1; exit }' || true)"
+fi
+[[ -n "$ip" ]] || fail "could not resolve Tailscale IP for $PHONE_HOST"
+
+target="${ip}:${ADB_PORT}"
+
+connect_adb() {
+  local attempt=0
+  while (( attempt < 24 )); do
+    attempt=$((attempt + 1))
+    if timeout "$ADB_TIMEOUT" adb -s "$target" shell true >/dev/null 2>&1; then
+      return 0
+    fi
+    timeout "$ADB_TIMEOUT" adb connect "$target" >/dev/null 2>&1 || true
+    if timeout "$ADB_TIMEOUT" adb -s "$target" shell true >/dev/null 2>&1; then
+      return 0
+    fi
+    if (( attempt == 1 || attempt % 6 == 0 )); then
+      note "waiting for ADB on $target (attempt $attempt/24) — unlock $PHONE_HOST ..."
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+note "connecting to $target ..."
+if ! connect_adb; then
+  fail "ADB never came up on $target. Unlock the phone, wait ~60s, or run: redmi-adb-setup"
+fi
+
+note "connected."
+
+if adb -s "$target" shell pm path "$OLD_PKG" >/dev/null 2>&1; then
+  note "removing $OLD_PKG ..."
+  adb -s "$target" uninstall "$OLD_PKG" >/dev/null
+  note "removed F-Droid scrcpy (wireless-debug pairing client)."
+else
+  note "$OLD_PKG not installed — skipping uninstall."
+fi
+
+if adb -s "$target" shell pm path "$NEW_PKG" >/dev/null 2>&1; then
+  note "updating $NEW_PKG ..."
+  adb -s "$target" install -r "$APK" >/dev/null
+else
+  note "installing $NEW_PKG ..."
+  adb -s "$target" install "$APK" >/dev/null
+fi
+
+note "done. On the Redmi, open ScrcpyForAndroid and connect to pixel-7:5555"

@@ -8,6 +8,11 @@ xset -r 2>/dev/null || true
 xset r rate 250 30 2>/dev/null || true
 
 echo "escape-fix: restarting input stack..."
+if pgrep -x Cap >/dev/null; then
+  echo "escape-fix: killing Cap (global input hooks eat Escape)..."
+  killall Cap 2>/dev/null || true
+  sleep 0.3
+fi
 killall xcape 2>/dev/null || true
 ibus restart 2>/dev/null || true
 sleep 0.5
@@ -22,5 +27,8 @@ if [[ -x "$HOME/.local/scripts/xcape-rofi-super-tap" ]]; then
   echo "escape-fix: starting xcape Super-tap..."
   "$HOME/.local/scripts/xcape-rofi-super-tap" &
 fi
+
+# Neovim/Kitty can leave CSI u keyboard protocol stuck in existing terminals.
+printf '\033[<u\033[>0u' 2>/dev/null || true
 
 echo "escape-fix: done. Try Escape in vim insert mode."

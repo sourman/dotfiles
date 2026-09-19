@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Machine-wide My Machines worker: register every git checkout under ~/work so
+# the machine appears for all projects, not just one IDE workspace or dotfiles.
+#
+# We intentionally skip $HOME (dotfiles repo) unless CURSOR_WORKER_INCLUDE_DOTFILES=1.
+
+WORK_ROOT="${CURSOR_WORKER_ROOT:-$HOME/work}"
+DATA_DIR="${CURSOR_DATA_DIR:-$HOME/.local/share/cursor-agent/my-machines}"
+NAME="${CURSOR_WORKER_NAME:-debian-ahmed}"
+MANAGEMENT_ADDR="${CURSOR_WORKER_MANAGEMENT_ADDR:-127.0.0.1:9477}"
+
+args=(
+  --name "$NAME"
+  --data-dir "$DATA_DIR"
+  --computer-use
+  --display :0
+  --share-desktop view_and_control
+  --identity-socket
+  --idle-release-timeout 0
+  --management-addr "$MANAGEMENT_ADDR"
+  --label "scope=machine"
+)
+
+mapfile -t repos < <(
+  find "$WORK_ROOT" -name .git -type d ! -path '*/cora-worktrees/*' -printf '%h\n' 2>/dev/null | sort -u
+)
+
+if ((${#repos[@]} == 0)); then
+  echo "cursor-agent-worker: no git repos found under $WORK_ROOT" >&2
+  exit 1
+fi
+
+for repo in "${repos[@]}"; do
+  args+=(--worker-dir "$repo")
+done
+
+if [[ "${CURSOR_WORKER_INCLUDE_DOTFILES:-0}" == "1" ]]; then
+  args+=(--worker-dir "$HOME")
+fi
+
+echo "cursor-agent-worker: registering ${#repos[@]} repos under $WORK_ROOT" >&2
+exec "${CURSOR_AGENT_BIN:-$HOME/.local/bin/cursor-agent}" worker "${args[@]}" start --verbose

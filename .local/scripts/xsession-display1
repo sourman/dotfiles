@@ -1,0 +1,7 @@
+#!/bin/sh
+# X session client for display :1 (Ctrl+Alt+F8). Not used by LightDM on :0.
+export PATH="$HOME/.local/bin:$HOME/.local/scripts:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+[ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
+# startx passes this script as the sole client — need our own session bus (unlike LightDM on :0).
+exec dbus-launch --exit-with-session /usr/bin/startxfce4
