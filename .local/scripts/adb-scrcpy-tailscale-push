@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# adb wrapper: full-size "adb push" over Tailscale wireless ADB often never exits and
+# can leave a 0-byte scrcpy-server.jar. scrcpy treats that as a failed push.
+# Intercept pushes to /data/local/tmp/scrcpy-server.jar and upload in small chunks.
+
+set -euo pipefail
+
+REAL_ADB="${ADB_REAL:-/opt/android-sdk/platform-tools/adb}"
+CHUNK_BYTES="${SCRCPY_PUSH_CHUNK_BYTES:-50000}"
+REMOTE_JAR="/data/local/tmp/scrcpy-server.jar"
+
+run_real() {
+  exec "$REAL_ADB" "$@"
+}
+
+args=("$@")
+push_idx=-1
+for i in "${!args[@]}"; do
+  if [[ "${args[$i]}" == "push" ]]; then
+    push_idx="$i"
+    break
+  fi
+done
+
+if [[ "$push_idx" -lt 0 ]]; then
+  run_real "$@"
+fi
+
+serial=()
+for i in "${!args[@]}"; do
+  if [[ "${args[$i]}" == "-s" && $((i + 1)) -lt ${#args[@]} ]]; then
+    serial=(-s "${args[$((i + 1))]}")
+    break
+  fi
+done
+
+local_path=""
+remote_path=""
+set -- "${args[@]:$((push_idx + 1))}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s)
+      shift 2
+      ;;
+    *)
+      if [[ -z "$local_path" ]]; then
+        local_path="$1"
+      else
+        remote_path="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$local_path" || -z "$remote_path" ]]; then
+  echo "adb: push requires <source> and <destination> arguments" >&2
+  exit 1
+fi
+
+if [[ "$remote_path" != "$REMOTE_JAR" ]]; then
+  exec "$REAL_ADB" push "${serial[@]}" "$local_path" "$remote_path"
+fi
+
+if [[ ! -f "$local_path" ]]; then
+  echo "adb: error: cannot stat '$local_path': No such file or directory" >&2
+  exit 1
+fi
+
+want_size="$(stat -c%s "$local_path")"
+got_size="$(timeout 8 "$REAL_ADB" "${serial[@]}" shell "stat -c %s '$REMOTE_JAR' 2>/dev/null || echo 0" 2>/dev/null | tr -d '\r' || echo 0)"
+if [[ "$got_size" == "$want_size" && "$want_size" -gt 0 ]]; then
+  echo "$local_path: 1 file pushed, 0 skipped. (already on device)"
+  exit 0
+fi
+
+tmpdir=""
+cleanup() {
+  [[ -n "$tmpdir" && -d "$tmpdir" ]] && rm -rf "$tmpdir"
+}
+trap cleanup EXIT
+
+tmpdir="$(mktemp -d)"
+# GNU split -d appends digits to the prefix (chunk00, chunk01), not chunk-/00.
+chunk_prefix="$tmpdir/chunk"
+
+timeout 12 "$REAL_ADB" "${serial[@]}" shell "rm -f '$REMOTE_JAR' /data/local/tmp/.scrcpy-chunk-*" >/dev/null 2>&1 || true
+
+shopt -s nullglob
+split -b "$CHUNK_BYTES" -d "$local_path" "$chunk_prefix"
+chunks_on_device=()
+
+for chunk in "$chunk_prefix"*; do
+  base="$(basename "$chunk")"
+  remote_chunk="/data/local/tmp/.scrcpy-chunk-$base"
+  if ! timeout 45 "$REAL_ADB" "${serial[@]}" push "$chunk" "$remote_chunk" >/dev/null; then
+    echo "adb: error: failed to push scrcpy-server chunk $base" >&2
+    exit 1
+  fi
+  chunks_on_device+=("$remote_chunk")
+done
+
+if ((${#chunks_on_device[@]} == 0)); then
+  echo "adb: error: no scrcpy-server chunks to push" >&2
+  exit 1
+fi
+
+assemble_cmd="cat"
+for remote_chunk in "${chunks_on_device[@]}"; do
+  assemble_cmd+=" $remote_chunk"
+done
+assemble_cmd+=" > '$REMOTE_JAR'"
+
+if ! timeout 60 "$REAL_ADB" "${serial[@]}" shell "$assemble_cmd && rm -f /data/local/tmp/.scrcpy-chunk-*"; then
+  echo "adb: error: failed to assemble scrcpy-server on device" >&2
+  exit 1
+fi
+
+got_size="$(timeout 8 "$REAL_ADB" "${serial[@]}" shell "stat -c %s '$REMOTE_JAR'" 2>/dev/null | tr -d '\r' || echo 0)"
+if [[ "$got_size" != "$want_size" ]]; then
+  echo "adb: error: scrcpy-server size mismatch (want $want_size, got $got_size)" >&2
+  exit 1
+fi
+
+echo "$local_path: 1 file pushed, 0 skipped. $(awk "BEGIN {printf \"%.1f MB/s\", $want_size/1024/1024}") (chunked for Tailscale ADB)"
+exit 0

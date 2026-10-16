@@ -15,6 +15,11 @@ PHONE_HOST="${PIXEL_HOST:-pixel-7}"
 ADB_PORT="${PIXEL_ADB_PORT:-5555}"
 ADB_TIMEOUT="${PIXEL_ADB_TIMEOUT:-5}"
 PING_TIMEOUT="${PIXEL_PING_TIMEOUT:-3}"
+PING_RETRIES="${PIXEL_PING_RETRIES:-12}"   # ~60s — cellular handover can take a while
+PING_RETRY_SLEEP="${PIXEL_PING_RETRY_SLEEP:-5}"
+ADB_CONNECT_RETRIES="${PIXEL_ADB_CONNECT_RETRIES:-18}"   # ~90s — post-reboot auto-enable delay
+ADB_CONNECT_RETRY_SLEEP="${PIXEL_ADB_CONNECT_RETRY_SLEEP:-5}"
+TAILSCALE_PKG="com.tailscale.ipn"
 
 fail() {
   echo "pixel: $*" >&2
@@ -49,7 +54,7 @@ else
   fi
 
   ip="${peer_line%% *}"
-  target="${PHONE_HOST}:${ADB_PORT}"
+  target="${ip}:${ADB_PORT}"
   ping_host="$PHONE_HOST"
 
   # Tailscale status can show "active; direct ...; offline, last seen ..." on one
@@ -63,39 +68,181 @@ else
   fi
 fi
 
-# Drop stale IP-based duplicates before connect so adb/scrcpy never see two devices.
+# Drop stale hostname/IP duplicates so adb/scrcpy never see two devices.
 ip_target="${ip}:${ADB_PORT}"
+host_target="${PHONE_HOST}:${ADB_PORT}"
+adb disconnect "$host_target" >/dev/null 2>&1 || true
 if [[ "$target" != "$ip_target" ]]; then
   adb disconnect "$ip_target" >/dev/null 2>&1 || true
 fi
 
-ping_out="$(tailscale ping --until-direct=false -c 1 -timeout "${PING_TIMEOUT}s" "$ping_host" 2>&1)" || true
-if [[ "$ping_out" != *"pong from"* ]]; then
-  fail "cannot reach $PHONE_HOST at $ip over Tailscale (ping timed out after ${PING_TIMEOUT}s). The phone may be asleep or off-network."
+wake_tailscale_over_adb() {
+  local serial
+  while read -r serial; do
+    [[ -n "$serial" ]] || continue
+    adb -s "$serial" shell am broadcast -a com.tailscale.ipn.CONNECT_VPN \
+      -n "${TAILSCALE_PKG}/.IPNReceiver" >/dev/null 2>&1 || true
+  done < <(adb devices 2>/dev/null | awk 'NR>1 && $2=="device" { print $1 }')
+}
+
+tailscale_ping_ok() {
+  # Exit code 1 when only DERP works (no direct path) — check output, not status.
+  local out
+  out="$(tailscale ping --until-direct=false -c 1 -timeout "${PING_TIMEOUT}s" "$ping_host" 2>&1)" || true
+  [[ "$out" == *"pong from"* ]]
+}
+
+if ! tailscale_ping_ok; then
+  note "tailscale ping to $ip failed — common after WiFi→mobile handover while the app still shows connected"
+  note "retrying for up to $((PING_RETRIES * PING_RETRY_SLEEP))s ..."
+  woke=0
+  for ((i = 1; i <= PING_RETRIES; i++)); do
+    if tailscale_ping_ok; then
+      note "tailscale path recovered (attempt $i)"
+      break
+    fi
+    if [[ "$woke" -eq 0 ]] && adb devices 2>/dev/null | awk 'NR>1 && $2=="device" { found=1 } END { exit !found }'; then
+      note "nudging Tailscale over any connected ADB session ..."
+      wake_tailscale_over_adb
+      woke=1
+    fi
+    if [[ "$i" -lt "$PING_RETRIES" ]]; then
+      sleep "$PING_RETRY_SLEEP"
+    fi
+  done
+  if ! tailscale_ping_ok; then
+    fail "cannot reach $PHONE_HOST at $ip over Tailscale after retries. On the phone: toggle Tailscale off/on, or toggle airplane mode. Update Tailscale to 1.99+ (fixes mobile handover)."
+  fi
 fi
+
+ping_detail="$(tailscale ping --until-direct=false -c 1 "$ping_host" 2>&1 | tail -1 || true)"
+if [[ "$ping_detail" == *"DERP"* ]]; then
+  note "using DERP relay — normal on mobile data; direct path returns on WiFi"
+fi
+
+# Broken /opt/scrcpy installs often omit icons and crash SDL on startup.
+icon_dir="${SCRCPY_ICON_DIR:-$HOME/.local/share/scrcpy-icons}"
+if [[ ! -f "$icon_dir/scrcpy.png" ]]; then
+  mkdir -p "$icon_dir"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "$icon_dir/scrcpy.png" \
+      "https://raw.githubusercontent.com/Genymobile/scrcpy/v4.0/app/data/scrcpy.png" \
+      >/dev/null 2>&1 || true
+    curl -fsSL -o "$icon_dir/disconnected.png" \
+      "https://raw.githubusercontent.com/Genymobile/scrcpy/v4.0/app/data/disconnected.png" \
+      >/dev/null 2>&1 || true
+  fi
+fi
+export SCRCPY_ICON_DIR="$icon_dir"
+export SCRCPY_SERVER_PATH="${SCRCPY_SERVER_PATH:-/opt/scrcpy/scrcpy-server}"
+
+pick_usb_serial() {
+  adb devices 2>/dev/null | awk 'NR>1 && $2=="device" && $1 !~ /:/ { print $1; exit }'
+}
+
+enable_adb_tcpip_usb() {
+  local usb
+  usb="$(pick_usb_serial)"
+  [[ -n "$usb" ]] || return 1
+  note "USB device $usb attached — running adb tcpip $ADB_PORT ..."
+  if ! adb -s "$usb" tcpip "$ADB_PORT" >/dev/null 2>&1; then
+    return 1
+  fi
+  sleep 2
+  return 0
+}
+
+adb_session_ok() {
+  timeout "$ADB_TIMEOUT" adb -s "$target" shell true >/dev/null 2>&1
+}
+
+drop_stale_adb_session() {
+  local line
+  line="$(adb devices 2>/dev/null | awk -v t="$target" -v i="$ip_target" '
+    NR>1 && ($1 == t || $1 == i) { print $1; exit }')" || true
+  [[ -z "$line" ]] && return 0
+  note "dropping stale ADB session for $line ..."
+  adb disconnect "$line" >/dev/null 2>&1 || true
+  if [[ "$line" != "$ip_target" && "$target" != "$ip_target" ]]; then
+    adb disconnect "$ip_target" >/dev/null 2>&1 || true
+  fi
+  if [[ "$line" != "$target" ]]; then
+    adb disconnect "$target" >/dev/null 2>&1 || true
+  fi
+}
+
+try_lan_wake() {
+  command -v redmi-wake >/dev/null 2>&1 || return 1
+  REDMI_HOST="$PHONE_HOST" REDMI_ADB_PORT="$ADB_PORT" REDMI_IP="${PIXEL_IP:-}" redmi-wake
+}
+
+connect_adb() {
+  local attempt=0 usb_attempted=0 wake_attempted=0 out rc=0
+
+  while (( attempt < ADB_CONNECT_RETRIES )); do
+    attempt=$((attempt + 1))
+
+    if adb_session_ok; then
+      return 0
+    fi
+
+    drop_stale_adb_session
+
+    out=""
+    rc=0
+    if ! out="$(timeout "$ADB_TIMEOUT" adb connect "$target" 2>&1)"; then
+      rc=$?
+    fi
+
+    if adb_session_ok; then
+      return 0
+    fi
+
+    if [[ "$rc" -eq 124 ]]; then
+      note "adb connect timed out (attempt $attempt/$ADB_CONNECT_RETRIES) ..."
+    elif [[ "$out" == *"refused"* ]]; then
+      if [[ "$usb_attempted" -eq 0 ]] && enable_adb_tcpip_usb; then
+        usb_attempted=1
+        continue
+      fi
+      if [[ "$wake_attempted" -eq 0 ]]; then
+        wake_attempted=1
+        note "trying LAN wake (same WiFi) via redmi-wake ..."
+        if try_lan_wake 2>/dev/null; then
+          continue
+        fi
+      fi
+      if [[ "$attempt" -eq 1 ]]; then
+        note "port $ADB_PORT not listening — post-reboot; try USB or redmi-wake with PIXEL_HOST=$PHONE_HOST"
+      fi
+    elif [[ -n "$out" ]] && [[ "$out" != *"already connected"* ]]; then
+      note "adb connect: ${out##*$'\n'}"
+    fi
+
+    if (( attempt < ADB_CONNECT_RETRIES )); then
+      sleep "$ADB_CONNECT_RETRY_SLEEP"
+    fi
+  done
+
+  return 1
+}
 
 note "connecting to $PHONE_HOST at $target ..."
 
-adb_out=""
-if ! adb_out="$(timeout "$ADB_TIMEOUT" adb connect "$target" 2>&1)"; then
-  rc=$?
-  if [[ "$rc" -eq 124 ]]; then
-    fail "ADB on $target did not answer within ${ADB_TIMEOUT}s. The phone is reachable on Tailscale, but wireless ADB is not up (unlock the phone, or replug USB once and run: adb tcpip $ADB_PORT)."
-  fi
-  if [[ -n "$adb_out" ]]; then
-    fail "adb connect $target failed: $adb_out"
-  fi
-  fail "adb connect $target failed (exit $rc)"
+if ! connect_adb; then
+  fail "ADB on $target never came up. Tailscale works but wireless ADB is off after reboot.
+  • Plug USB once and run: adb tcpip $ADB_PORT
+  • Or if already paired: wait ~60s after unlock and retry pixel
+  • Same-WiFi wake: REDMI_HOST=$PHONE_HOST redmi-wake"
 fi
 
-if [[ "$adb_out" == *"failed"* ]] || [[ "$adb_out" == *"refused"* ]]; then
-  fail "adb connect $target failed: $adb_out"
-fi
-
-if ! timeout "$ADB_TIMEOUT" adb -s "$target" shell true >/dev/null 2>&1; then
-  fail "connected to $target, but ADB is not responding. Unlock the phone and try again."
+adb_wrap="${PIXEL_ADB_WRAP:-$HOME/.local/scripts/adb-scrcpy-tailscale-push}"
+if [[ -x "$adb_wrap" ]]; then
+  export ADB="$adb_wrap"
+  export ADB_REAL="${ADB_REAL:-/opt/android-sdk/platform-tools/adb}"
 fi
 
 note "launching scrcpy ..."
 # Always mirror the physical screen — stale scrcpy virtual displays can cause a blank window.
-exec scrcpy -s "$target" --display-id=0 -b2M -m800 --max-fps=7 --no-audio "$@"
+# --force-adb-forward: wireless/Tailscale; chunked ADB wrapper handles scrcpy-server push.
+exec scrcpy -s "$target" --force-adb-forward --display-id=0 -b2M -m800 --max-fps=7 --no-audio "$@"
