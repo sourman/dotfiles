@@ -43,6 +43,14 @@
 .config/nvim/*
 !.config/nvim/init.vim
 
+# picom / Xfce autostart (dotfiles)
+!.config/picom/
+.config/picom/*
+!.config/picom/picom.conf
+!.config/autostart/
+.config/autostart/*
+!.config/autostart/picom.desktop
+
 # --- scripts (version-controlled text scripts, on PATH via .bashrc) ---
 # Re-include only .local/scripts/ — ignore bin (binaries), lib (site-packages), etc.
 !.local/

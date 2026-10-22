@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=picom
+Comment=Compositor (low-CPU GLX, rounded corners)
+Exec=picom -b --config /home/ahmed/.config/picom/picom.conf
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
